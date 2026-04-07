@@ -1,0 +1,171 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+name: AI Config Admin Hotfix
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - prod
+
+concurrency:
+  group: ai-config-admin-hotfix-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  apply-hotfix:
+    name: Apply AI Config Admin Hotfix (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve project config
+        id: config
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ inputs.environment }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.config.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::${{ steps.config.outputs.project_number_secret }} is not configured for the '${{ inputs.environment }}' environment."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.config.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: ${{ steps.config.outputs.deployer_sa }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ steps.config.outputs.project_id }}
+
+      - name: Install Cloud SQL Proxy
+        run: |
+          CLOUD_SQL_PROXY_VERSION="2.14.1"
+          CLOUD_SQL_PROXY_SHA256="e48115261929445f468ae7ae86be199781bafda56837c9f33644892df8d46997"
+          curl -fsSLo cloud-sql-proxy "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          echo "${CLOUD_SQL_PROXY_SHA256}  cloud-sql-proxy" | sha256sum --check --
+          chmod +x cloud-sql-proxy
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Get database credentials
+        id: db-creds
+        env:
+          PROJECT_ID: ${{ steps.config.outputs.project_id }}
+          DB_SECRET_NAME: ${{ steps.config.outputs.db_secret_name }}
+        run: |
+          RAW=$(gcloud secrets versions access latest \
+            --secret="$DB_SECRET_NAME" \
+            --project="$PROJECT_ID")
+          echo "::add-mask::$RAW"
+
+          DB_NAME=$(echo "$RAW" | tr ';' '\n' | grep -i '^Database=' | cut -d= -f2)
+          DB_USER=$(echo "$RAW" | tr ';' '\n' | grep -i '^Username=' | cut -d= -f2)
+          DB_PASS=$(echo "$RAW" | tr ';' '\n' | grep -i '^Password=' | cut -d= -f2-)
+          echo "::add-mask::$DB_PASS"
+
+          echo "PGHOST=127.0.0.1" >> "$GITHUB_ENV"
+          echo "PGPORT=5432" >> "$GITHUB_ENV"
+          echo "PGDATABASE=$DB_NAME" >> "$GITHUB_ENV"
+          echo "PGUSER=$DB_USER" >> "$GITHUB_ENV"
+          echo "db_pass=$DB_PASS" >> "$GITHUB_OUTPUT"
+
+      - name: Start Cloud SQL Proxy
+        env:
+          INSTANCE: ${{ steps.config.outputs.cloud_sql_instance }}
+        run: |
+          ./cloud-sql-proxy "$INSTANCE" --port=5432 &
+          sleep 5
+          echo "Cloud SQL Proxy started"
+
+      - name: Apply AI config admin migration if needed
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          BEFORE=$(psql -t -A -c "SELECT coalesce(to_regclass('public.ai_config_overrides')::text, ''), coalesce(to_regclass('public.ai_config_audit_log')::text, '');")
+          echo "Before: $BEFORE"
+
+          psql -v ON_ERROR_STOP=1 <<'EOSQL'
+          CREATE TABLE IF NOT EXISTS ai_config_overrides (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            config_section TEXT NOT NULL,
+            config_key TEXT NOT NULL,
+            config_value JSONB NOT NULL,
+            value_type TEXT NOT NULL,
+            description TEXT,
+            updated_by TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_active BOOLEAN NOT NULL DEFAULT TRUE
+          );
+
+          DO $$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1
+              FROM pg_constraint
+              WHERE conname = 'ai_config_overrides_config_section_config_key_key'
+            ) THEN
+              ALTER TABLE ai_config_overrides
+                ADD CONSTRAINT ai_config_overrides_config_section_config_key_key
+                UNIQUE (config_section, config_key);
+            END IF;
+          END $$;
+
+          CREATE TABLE IF NOT EXISTS ai_config_audit_log (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            config_section TEXT NOT NULL,
+            config_key TEXT NOT NULL,
+            old_value JSONB,
+            new_value JSONB NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            change_reason TEXT
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_ai_config_overrides_section ON ai_config_overrides(config_section);
+          CREATE INDEX IF NOT EXISTS idx_ai_config_overrides_active ON ai_config_overrides(is_active) WHERE is_active = TRUE;
+          CREATE INDEX IF NOT EXISTS idx_ai_config_audit_log_section ON ai_config_audit_log(config_section, changed_at DESC);
+          EOSQL
+          echo "Applied idempotent AI config admin hotfix SQL"
+
+          CONSTRAINT_COUNT=$(psql -t -A -c "SELECT COUNT(*) FROM pg_constraint WHERE conname = 'ai_config_overrides_config_section_config_key_key';")
+          INDEX_COUNT=$(psql -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('idx_ai_config_overrides_section', 'idx_ai_config_overrides_active', 'idx_ai_config_audit_log_section');")
+
+          if psql -t -A -c "SELECT coalesce(to_regclass('public.schema_migrations')::text, '');" | grep -qx 'schema_migrations'; then
+            if [ "$CONSTRAINT_COUNT" != "1" ] || [ "$INDEX_COUNT" != "3" ]; then
+              echo "Hotfix failed: expected admin config constraint/indexes to exist before tracking migration" >&2
+              exit 1
+            fi
+
+            CHECKSUM=$(sha256sum Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/014_AddAIConfigAdmin.sql | awk '{print $1}')
+            psql -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename, checksum) VALUES ('014_AddAIConfigAdmin.sql', '$CHECKSUM') ON CONFLICT (filename) DO NOTHING;"
+            echo "Tracked 014_AddAIConfigAdmin.sql"
+          else
+            echo "schema_migrations table not present; skipped tracking insert"
+          fi
+
+          AFTER=$(psql -t -A -c "SELECT coalesce(to_regclass('public.ai_config_overrides')::text, ''), coalesce(to_regclass('public.ai_config_audit_log')::text, '');")
+          echo "After: $AFTER"
+
+          if [ "$AFTER" != "ai_config_overrides|ai_config_audit_log" ]; then
+            echo "Hotfix failed: expected admin config tables to exist" >&2
+            exit 1
+          fi

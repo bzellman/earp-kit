@@ -1,0 +1,161 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Backend Tests
+# Runs .NET build, tests, and coverage for the <YOUR_API_PROJECT> project.
+# Called via workflow_call from ci-gates for PR checks.
+# Also runs standalone on push to main for post-merge validation.
+
+name: Backend Tests
+
+concurrency:
+  group: backend-tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Infrastructure/<YOUR_API_PROJECT>/**'
+      - 'Infrastructure/<YOUR_API_PROJECT>.Tests/**'
+      - '!Infrastructure/<YOUR_API_PROJECT>/**.md'
+      - '!Infrastructure/<YOUR_API_PROJECT>.Tests/**.md'
+      - '.github/workflows/backend-tests.yml'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    name: Run .NET Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Infrastructure/**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: |
+          cd Infrastructure/<YOUR_API_PROJECT>
+          dotnet restore <YOUR_API_PROJECT>.GCP.csproj
+
+      - name: Build
+        run: |
+          cd Infrastructure/<YOUR_API_PROJECT>
+          dotnet build <YOUR_API_PROJECT>.GCP.csproj --no-restore --configuration Release
+
+      - name: Run Tests
+        run: |
+          cd Infrastructure/<YOUR_API_PROJECT>.Tests
+          dotnet test --configuration Release \
+            --filter "FullyQualifiedName!~Integration" \
+            --logger "trx;LogFileName=test-results.trx" \
+            --logger "console;verbosity=detailed" \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults \
+            /p:CoverletOutputFormat=cobertura \
+            /p:CoverletOutput=./TestResults/coverage.cobertura.xml
+
+      - name: Generate Coverage Report
+        continue-on-error: true
+        run: |
+          cd Infrastructure/<YOUR_API_PROJECT>.Tests
+          COVERAGE_FILES=$(find ./TestResults -name "coverage.cobertura.xml" 2>/dev/null | head -1)
+          if [ -z "$COVERAGE_FILES" ]; then
+            echo "::warning::No coverage files found. Install coverlet.collector NuGet package for coverage."
+            echo "COVERAGE_PERCENT=N/A" >> $GITHUB_ENV
+            exit 0
+          fi
+          dotnet tool install -g dotnet-reportgenerator-globaltool 2>/dev/null || true
+          reportgenerator \
+            -reports:"./TestResults/**/coverage.cobertura.xml" \
+            -targetdir:"./TestResults/CoverageReport" \
+            -reporttypes:"HtmlInline_AzurePipelines;Cobertura;JsonSummary"
+
+          COVERAGE=$(cat ./TestResults/CoverageReport/Summary.json | jq -r '.summary.linecoverage' | awk '{printf "%.1f", $1}')
+          echo "Code Coverage: ${COVERAGE}%"
+          echo "COVERAGE_PERCENT=${COVERAGE}" >> $GITHUB_ENV
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: backend-test-results
+          path: |
+            Infrastructure/<YOUR_API_PROJECT>.Tests/TestResults/**/*.trx
+            Infrastructure/<YOUR_API_PROJECT>.Tests/TestResults/CoverageReport/
+
+      - name: Comment PR with Coverage
+        if: inputs.pr_number != ''
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            const coverage = process.env.COVERAGE_PERCENT || 'N/A';
+            const coverageFloat = parseFloat(coverage) || 0;
+            let status = 'N/A';
+            if (coverage !== 'N/A') {
+              status = coverageFloat >= 80 ? 'Passing' :
+                       coverageFloat >= 60 ? 'Warning' : 'Below Target';
+            }
+
+            const body = [
+              '## Backend Test Results',
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Coverage | ${coverage}${coverage !== 'N/A' ? '%' : ''} |`,
+              '| Target | 80% |',
+              `| Status | ${status} |`,
+              '',
+              'View the full test report in the Actions tab.'
+            ].join('\n');
+
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            } else {
+              core.info('No PR number available; skipping coverage comment');
+            }
+
+      - name: Check Coverage Threshold
+        run: |
+          COVERAGE="${COVERAGE_PERCENT:-N/A}"
+          if [ "$COVERAGE" = "N/A" ] || [ "$COVERAGE" = "0" ]; then
+            echo "::warning::No coverage data available. Add coverlet.collector to the test project."
+          else
+            THRESHOLD=80.0
+            if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+              echo "::warning::Code coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            else
+              echo "Code coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+            fi
+          fi

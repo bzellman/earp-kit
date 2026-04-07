@@ -1,0 +1,295 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Dev Auto-Deploy Workflow
+# Builds, tests, and deploys <YOUR_APP> backend to dev Cloud Run on push to main.
+# Image digest is output for downstream promotion workflows.
+
+name: Deploy to Dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Infrastructure/<YOUR_API_PROJECT>/**'
+      - 'webApps/app-admin-ui/**'
+      - '.github/actions/smoke-test/**'
+      - '.github/workflows/gcp-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests before deployment'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  REGION: 'us-central1'
+  PROJECT_ID: '<YOUR_GCP_PROJECT_DEV>'
+  SERVICE_NAME: '<YOUR_SERVICE_NAME>'
+  AR_REPO: '<YOUR_SERVICE_NAME>'
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('Infrastructure/**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: |
+          dotnet restore Infrastructure/<YOUR_API_PROJECT>/<YOUR_API_PROJECT>.GCP.csproj
+          dotnet restore Infrastructure/<YOUR_API_PROJECT>.Tests/<YOUR_API_PROJECT>.Tests.csproj
+
+      - name: Build
+        run: dotnet build Infrastructure/<YOUR_API_PROJECT>/<YOUR_API_PROJECT>.GCP.csproj --no-restore --configuration Release
+
+      - name: Run tests
+        run: |
+          dotnet test Infrastructure/<YOUR_API_PROJECT>.Tests/<YOUR_API_PROJECT>.Tests.csproj \
+            --no-restore --verbosity normal \
+            --filter "FullyQualifiedName!~Integration"
+
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.sha_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets.YOUR_DEV_GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '<YOUR_DEPLOYER_SA>@${{ env.PROJECT_ID }}.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "$REGION-docker.pkg.dev"
+
+      - name: Generate image metadata
+        id: meta
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          SHA_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$SERVICE_NAME:$GIT_SHA"
+          LATEST_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/$SERVICE_NAME:latest"
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Fetch Admin Google Client ID
+        id: admin_client_id
+        run: |
+          CLIENT_ID=$(gcloud secrets versions access latest --secret=ADMIN_GOOGLE_CLIENT_ID --project=${{ env.PROJECT_ID }})
+          echo "::add-mask::$CLIENT_ID"
+          echo "value=$CLIENT_ID" >> $GITHUB_OUTPUT
+
+      - name: Read cross-env Cloud Run URLs
+        id: env_urls
+        run: |
+          STAGING_URL=$(jq -r '.environments.staging.baseUrl // empty' Infrastructure/docs/api-endpoints.json)
+          PROD_URL=$(jq -r '.environments.prod.baseUrl // empty' Infrastructure/docs/api-endpoints.json)
+          echo "staging_config_url=${STAGING_URL}/admin/config" >> $GITHUB_OUTPUT
+          echo "prod_config_url=${PROD_URL}/admin/config" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          LATEST_TAG: ${{ steps.meta.outputs.latest_tag }}
+          VITE_GOOGLE_CLIENT_ID: ${{ steps.admin_client_id.outputs.value }}
+          VITE_API_BASE_URL_STAGING: ${{ steps.env_urls.outputs.staging_config_url }}
+          VITE_API_BASE_URL_PROD: ${{ steps.env_urls.outputs.prod_config_url }}
+        run: |
+          docker build \
+            --build-arg VITE_GOOGLE_CLIENT_ID="$VITE_GOOGLE_CLIENT_ID" \
+            --build-arg VITE_API_BASE_URL_STAGING="$VITE_API_BASE_URL_STAGING" \
+            --build-arg VITE_API_BASE_URL_PROD="$VITE_API_BASE_URL_PROD" \
+            -t "$SHA_TAG" \
+            -t "$LATEST_TAG" \
+            -f Infrastructure/<YOUR_API_PROJECT>/Dockerfile.gcp \
+            .
+
+      - name: Build OTel Collector sidecar image
+        run: |
+          COLLECTOR_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/otel-collector:latest"
+          docker build \
+            -t "$COLLECTOR_TAG" \
+            Infrastructure/otel-collector/
+
+      - name: Push Docker images
+        id: push
+        env:
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          LATEST_TAG: ${{ steps.meta.outputs.latest_tag }}
+        run: |
+          docker push "$SHA_TAG"
+          docker push "$LATEST_TAG"
+          COLLECTOR_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/otel-collector:latest"
+          docker push "$COLLECTOR_TAG"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$SHA_TAG" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment: dev
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets.YOUR_DEV_GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '<YOUR_DEPLOYER_SA>@${{ env.PROJECT_ID }}.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Deploy to Cloud Run
+        env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
+          PRIMARY_IMAGE: ${{ needs.build-and-push.outputs.image_tag }}
+          COLLECTOR_IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/otel-collector:latest
+        run: |
+          ./.github/scripts/deploy_cloud_run_service.sh
+
+      - name: Smoke test
+        uses: ./.github/actions/smoke-test
+        with:
+          service_name: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          source_sha: ${{ github.sha }}
+
+      - name: Check for Terraform drift (env vars)
+        continue-on-error: true
+        run: |
+          ACTUAL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" \
+            --format='json(spec.template.spec.containers[0].env)' | jq -r '.. | .name? // empty' | sort -u)
+          EXPECTED_SECRETS=$(awk '/secret_env_vars[[:space:]]*=[[:space:]]*\{/,/^[[:space:]]*\}/' Infrastructure/terraform/main.tf | \
+            grep -oE '[A-Z][A-Z0-9_]+[[:space:]]*=' | sed 's/[[:space:]]*=$//' | sort -u)
+          for secret in $EXPECTED_SECRETS; do
+            if ! echo "$ACTUAL" | grep -q "^${secret}$"; then
+              echo "::warning::Terraform drift: $secret missing from Cloud Run env. Run: gh workflow run gcp-terraform.yml -f environment=dev -f action=apply"
+            fi
+          done
+
+      - name: Check for Terraform drift (OTel sidecar dependency)
+        continue-on-error: true
+        env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
+          ENVIRONMENT_NAME: dev
+          EXPECTED_COLLECTOR_IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.AR_REPO }}/otel-collector:latest
+        run: |
+          ./.github/scripts/check_cloud_run_otel_sidecar.sh
+
+      - name: Check for IAM drift (Cloud Run SA roles)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # Get the service account used by Cloud Run
+          SA_EMAIL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" \
+            --format='value(spec.template.spec.serviceAccountName)')
+
+          if [ -z "$SA_EMAIL" ]; then
+            echo "::warning::Could not determine Cloud Run service account"
+            exit 0
+          fi
+
+          # Critical IAM roles the Cloud Run SA must have (from modules/cloud-run/main.tf)
+          REQUIRED_ROLES=(
+            "roles/cloudsql.client"
+            "roles/secretmanager.secretAccessor"
+            "roles/storage.objectAdmin"
+            "roles/aiplatform.user"
+          )
+
+          ACTUAL_ROLES=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+            --flatten="bindings[].members" \
+            --filter="bindings.members:${SA_EMAIL}" \
+            --format='value(bindings.role)' | sort -u)
+
+          MISSING=0
+          for role in "${REQUIRED_ROLES[@]}"; do
+            if ! echo "$ACTUAL_ROLES" | grep -q "^${role}$"; then
+              echo "::error::IAM drift: Cloud Run SA ($SA_EMAIL) is missing $role. Fix: gcloud projects add-iam-policy-binding $PROJECT_ID --member=serviceAccount:$SA_EMAIL --role=$role"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::$MISSING critical IAM role(s) missing. Run: gh workflow run gcp-terraform.yml -f environment=dev -f action=apply"
+            exit 1
+          fi
+
+          echo "IAM drift check passed: all ${#REQUIRED_ROLES[@]} critical roles present on $SA_EMAIL"
+
+      - name: Deployment summary
+        env:
+          IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          URL=$(gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" \
+            --format='value(status.url)')
+          REVISION=$(gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" \
+            --format='value(status.latestReadyRevisionName)')
+          echo "## Dev Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | dev |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | $PROJECT_ID |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | $SERVICE_NAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revision | $REVISION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Digest | $IMAGE_DIGEST |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | $GIT_SHA |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | $URL |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update API endpoints file
+        uses: ./.github/actions/update-api-endpoints
+        with:
+          environment: dev
+          service_name: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          commit_sha: ${{ github.sha }}
+          target_branch: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}

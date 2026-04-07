@@ -1,0 +1,138 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Terraform Infrastructure Workflow
+# Applies on push to main, supports manual dispatch.
+# PR terraform plans are handled inline by ci-gates.yml.
+
+name: Terraform Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Infrastructure/terraform/**'
+      - '.github/workflows/gcp-terraform.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to apply'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Terraform action'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+
+concurrency:
+  group: terraform-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: '1.6.0'
+  TF_VAR_region: 'us-central1'
+
+jobs:
+  terraform:
+    name: Terraform (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.environment)) || fromJSON('["dev"]') }}
+    defaults:
+      run:
+        working-directory: Infrastructure/terraform/environments/${{ matrix.environment }}
+    env:
+      TF_ENVIRONMENT: ${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve project config
+        id: config
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ matrix.environment }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.config.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::${{ steps.config.outputs.project_number_secret }} is not configured for the '${TF_ENVIRONMENT}' environment."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.config.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '${{ steps.config.outputs.terraform_sa }}'
+
+      - name: Install Terraform
+        env:
+          TF_VERSION: ${{ env.TF_VERSION }}
+        run: |
+          set -euo pipefail
+          base_url="https://releases.hashicorp.com/terraform/${TF_VERSION}"
+          curl -fsSLo /tmp/terraform.zip "${base_url}/terraform_${TF_VERSION}_linux_amd64.zip"
+          curl -fsSLo /tmp/terraform_SHA256SUMS "${base_url}/terraform_${TF_VERSION}_SHA256SUMS"
+          expected_sha="$(grep "terraform_${TF_VERSION}_linux_amd64.zip" /tmp/terraform_SHA256SUMS | awk '{print $1}')"
+          echo "${expected_sha}  /tmp/terraform.zip" | sha256sum --check --
+          unzip -q /tmp/terraform.zip -d /tmp/terraform-bin
+          echo "/tmp/terraform-bin" >> "$GITHUB_PATH"
+          /tmp/terraform-bin/terraform version
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive ../..
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend-config="bucket=${{ steps.config.outputs.state_bucket }}"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -no-color -input=false -out=tfplan \
+            -var="project_id=${{ steps.config.outputs.project_id }}" 2>&1 | tee plan_output.txt
+
+      - name: Terraform Apply
+        if: |
+          github.event_name == 'workflow_dispatch' && inputs.action == 'apply' &&
+          steps.plan.outcome == 'success'
+        run: terraform apply -auto-approve tfplan
+
+      - name: Create summary
+        if: always()
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          echo "## Terraform Summary - $TF_ENVIRONMENT" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | $FMT_OUTCOME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Init | $INIT_OUTCOME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | $VALIDATE_OUTCOME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plan | $PLAN_OUTCOME |" >> $GITHUB_STEP_SUMMARY

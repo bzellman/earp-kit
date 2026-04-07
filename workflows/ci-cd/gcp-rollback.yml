@@ -1,0 +1,161 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Cloud Run Rollback Workflow
+# Emergency rollback to a previous Cloud Run revision via traffic shifting.
+# Uses explicit secret references per environment (no dynamic secret names).
+
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      revision:
+        description: 'Specific revision to rollback to (leave empty for previous)'
+        required: false
+        type: string
+
+concurrency:
+  group: rollback-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  REGION: 'us-central1'
+  SERVICE_NAME: '<YOUR_SERVICE_NAME>'
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ROLLBACK_ENV: ${{ inputs.environment }}
+      TARGET_REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve project config
+        id: config
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ inputs.environment }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.config.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::${{ steps.config.outputs.project_number_secret }} is not configured for the '${ROLLBACK_ENV}' environment."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.config.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: ${{ steps.config.outputs.deployer_sa }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ steps.config.outputs.project_id }}
+
+      - name: Get current revisions
+        id: get-revisions
+        run: |
+          echo "Listing revisions for $SERVICE_NAME..."
+          REVISIONS=$(gcloud run revisions list \
+            --service="$SERVICE_NAME" \
+            --region="$REGION" \
+            --format='value(REVISION)' \
+            --sort-by='~DEPLOYED' \
+            --limit=5)
+
+          echo "Available revisions:"
+          echo "$REVISIONS"
+
+          CURRENT=$(echo "$REVISIONS" | head -1)
+          PREVIOUS=$(echo "$REVISIONS" | head -2 | tail -1)
+
+          if [ -z "$CURRENT" ]; then
+            echo "::error::No revisions found for $SERVICE_NAME"
+            exit 1
+          fi
+
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "previous=$PREVIOUS" >> $GITHUB_OUTPUT
+
+      - name: Determine target revision
+        id: target
+        env:
+          PREVIOUS_REV: ${{ steps.get-revisions.outputs.previous }}
+        run: |
+          if [ -n "$TARGET_REVISION" ]; then
+            echo "revision=$TARGET_REVISION" >> $GITHUB_OUTPUT
+          elif [ -n "$PREVIOUS_REV" ]; then
+            echo "revision=$PREVIOUS_REV" >> $GITHUB_OUTPUT
+          else
+            echo "::error::No previous revision available and no revision specified"
+            exit 1
+          fi
+
+      - name: Validate target revision exists
+        env:
+          TARGET_REV: ${{ steps.target.outputs.revision }}
+        run: |
+          echo "Validating revision: $TARGET_REV"
+          if ! gcloud run revisions describe "$TARGET_REV" \
+              --service="$SERVICE_NAME" \
+              --region="$REGION" \
+              --format='value(status.conditions[0].status)' > /dev/null 2>&1; then
+            echo "::error::Revision $TARGET_REV not found for service $SERVICE_NAME"
+            exit 1
+          fi
+          echo "Revision validated."
+
+      - name: Rollback to target revision
+        env:
+          TARGET_REV: ${{ steps.target.outputs.revision }}
+        run: |
+          echo "Rolling back $SERVICE_NAME to revision: $TARGET_REV"
+          gcloud run services update-traffic "$SERVICE_NAME" \
+            --region="$REGION" \
+            --to-revisions="$TARGET_REV=100"
+          echo "Rollback complete!"
+
+      - name: Verify rollback
+        continue-on-error: true
+        uses: ./.github/actions/smoke-test
+        with:
+          service_name: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          max_retries: '5'
+          retry_interval: '6'
+
+      - name: Create summary
+        if: always()
+        env:
+          PROJECT_ID: ${{ steps.config.outputs.project_id }}
+          CURRENT_REV: ${{ steps.get-revisions.outputs.current }}
+          TARGET_REV: ${{ steps.target.outputs.revision }}
+        run: |
+          echo "## Rollback Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $ROLLBACK_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | $PROJECT_ID |" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | $SERVICE_NAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Previous Revision | $CURRENT_REV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Rolled Back To | $TARGET_REV |" >> $GITHUB_STEP_SUMMARY

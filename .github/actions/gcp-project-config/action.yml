@@ -1,0 +1,94 @@
+name: Resolve GCP Project Config
+description: Emit placeholder-driven environment config for the workflow templates.
+
+inputs:
+  environment:
+    description: Target environment (dev, staging, prod)
+    required: true
+
+outputs:
+  environment:
+    description: Normalized environment name
+    value: ${{ steps.resolve.outputs.environment }}
+  project_id:
+    description: Target GCP project ID placeholder
+    value: ${{ steps.resolve.outputs.project_id }}
+  project_number_secret:
+    description: GitHub secret name that should contain the GCP project number
+    value: ${{ steps.resolve.outputs.project_number_secret }}
+  deployer_sa:
+    description: Deployer service account email placeholder
+    value: ${{ steps.resolve.outputs.deployer_sa }}
+  terraform_sa:
+    description: Terraform service account email placeholder
+    value: ${{ steps.resolve.outputs.terraform_sa }}
+  ops_review_sa:
+    description: Operations review service account email placeholder
+    value: ${{ steps.resolve.outputs.ops_review_sa }}
+  state_bucket:
+    description: Terraform state bucket placeholder
+    value: ${{ steps.resolve.outputs.state_bucket }}
+  db_secret_name:
+    description: Database connection secret placeholder
+    value: ${{ steps.resolve.outputs.db_secret_name }}
+  cloud_sql_instance:
+    description: Cloud SQL instance connection name placeholder
+    value: ${{ steps.resolve.outputs.cloud_sql_instance }}
+  service_name:
+    description: Cloud Run service name placeholder
+    value: ${{ steps.resolve.outputs.service_name }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        case "${{ inputs.environment }}" in
+          dev)
+            ENVIRONMENT="dev"
+            PROJECT_ID="<YOUR_GCP_PROJECT_DEV>"
+            PROJECT_NUMBER_SECRET="YOUR_DEV_GCP_PROJECT_NUMBER"
+            DB_SECRET_NAME="<YOUR_DEV_DB_SECRET_NAME>"
+            CLOUD_SQL_INSTANCE="<YOUR_DEV_CLOUD_SQL_INSTANCE>"
+            ;;
+          staging)
+            ENVIRONMENT="staging"
+            PROJECT_ID="<YOUR_GCP_PROJECT_STAGING>"
+            PROJECT_NUMBER_SECRET="YOUR_STAGING_GCP_PROJECT_NUMBER"
+            DB_SECRET_NAME="<YOUR_STAGING_DB_SECRET_NAME>"
+            CLOUD_SQL_INSTANCE="<YOUR_STAGING_CLOUD_SQL_INSTANCE>"
+            ;;
+          prod)
+            ENVIRONMENT="prod"
+            PROJECT_ID="<YOUR_GCP_PROJECT_PROD>"
+            PROJECT_NUMBER_SECRET="YOUR_PROD_GCP_PROJECT_NUMBER"
+            DB_SECRET_NAME="<YOUR_PROD_DB_SECRET_NAME>"
+            CLOUD_SQL_INSTANCE="<YOUR_PROD_CLOUD_SQL_INSTANCE>"
+            ;;
+          *)
+            echo "::error::Unsupported environment '${{ inputs.environment }}'"
+            exit 1
+            ;;
+        esac
+
+        SERVICE_NAME="<YOUR_SERVICE_NAME>"
+        DEPLOYER_SA="<YOUR_DEPLOYER_SA>@${PROJECT_ID}.iam.gserviceaccount.com"
+        TERRAFORM_SA="<YOUR_TERRAFORM_SA>@${PROJECT_ID}.iam.gserviceaccount.com"
+        OPS_REVIEW_SA="<YOUR_OPS_REVIEW_SA>@${PROJECT_ID}.iam.gserviceaccount.com"
+        STATE_BUCKET="<YOUR_TF_STATE_BUCKET>-${ENVIRONMENT}"
+
+        {
+          echo "environment=${ENVIRONMENT}"
+          echo "project_id=${PROJECT_ID}"
+          echo "project_number_secret=${PROJECT_NUMBER_SECRET}"
+          echo "deployer_sa=${DEPLOYER_SA}"
+          echo "terraform_sa=${TERRAFORM_SA}"
+          echo "ops_review_sa=${OPS_REVIEW_SA}"
+          echo "state_bucket=${STATE_BUCKET}"
+          echo "db_secret_name=${DB_SECRET_NAME}"
+          echo "cloud_sql_instance=${CLOUD_SQL_INSTANCE}"
+          echo "service_name=${SERVICE_NAME}"
+        } >> "$GITHUB_OUTPUT"

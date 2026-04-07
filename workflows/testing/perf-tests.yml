@@ -1,0 +1,224 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Performance Tests Workflow
+# Runs K6 load tests against <YOUR_APP> API in the target environment.
+# Safety: prod only allows smoke/health scenarios with read-only endpoints.
+#
+# Security: All user-controllable inputs (environment, scenario) come from
+# type: choice dropdowns, not free-text. No untrusted input is interpolated
+# into run: commands.
+
+name: Performance Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      scenario:
+        description: 'Test scenario to run'
+        required: true
+        default: 'smoke'
+        type: choice
+        options:
+          - smoke
+          - health
+          - memories
+          - search
+          - social
+          - stress
+  schedule:
+    # Weekly Monday smoke tests
+    - cron: '0 6 * * 1'  # dev smoke at 6am UTC
+    - cron: '0 7 * * 1'  # staging smoke at 7am UTC
+
+concurrency:
+  group: perf-${{ inputs.environment || 'scheduled' }}
+  cancel-in-progress: true
+
+env:
+  REGION: 'us-central1'
+
+jobs:
+  validate:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.resolve.outputs.environment }}
+      scenario: ${{ steps.resolve.outputs.scenario }}
+    steps:
+      - name: Resolve inputs for scheduled runs
+        id: resolve
+        env:
+          INPUT_ENV: ${{ inputs.environment }}
+          INPUT_SCENARIO: ${{ inputs.scenario }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Determine environment from cron schedule
+            if [ "$EVENT_SCHEDULE" = "0 6 * * 1" ]; then
+              echo "environment=dev" >> "$GITHUB_OUTPUT"
+              echo "scenario=smoke" >> "$GITHUB_OUTPUT"
+            elif [ "$EVENT_SCHEDULE" = "0 7 * * 1" ]; then
+              echo "environment=staging" >> "$GITHUB_OUTPUT"
+              echo "scenario=smoke" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "environment=$INPUT_ENV" >> "$GITHUB_OUTPUT"
+            echo "scenario=$INPUT_SCENARIO" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Enforce prod safety guardrails
+        env:
+          TARGET_ENV: ${{ steps.resolve.outputs.environment }}
+          SCENARIO: ${{ steps.resolve.outputs.scenario }}
+        run: |
+          if [ "$TARGET_ENV" = "prod" ]; then
+            if [ "$SCENARIO" != "smoke" ] && [ "$SCENARIO" != "health" ]; then
+              echo "::error::BLOCKED: Scenario '$SCENARIO' is not allowed in prod."
+              echo "::error::Only 'smoke' and 'health' scenarios are permitted against production."
+              exit 1
+            fi
+            echo "::notice::Prod safety check passed. Running read-only '$SCENARIO' scenario."
+          fi
+
+  perf-test:
+    name: Run K6 (${{ needs.validate.outputs.scenario }} @ ${{ needs.validate.outputs.environment }})
+    runs-on: ubuntu-latest
+    needs: [validate]
+    environment: ${{ needs.validate.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARGET_ENV: ${{ needs.validate.outputs.environment }}
+      SCENARIO: ${{ needs.validate.outputs.scenario }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve GCP project config
+        id: gcp
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ env.TARGET_ENV }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.gcp.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::GitHub secret '${{ steps.gcp.outputs.project_number_secret }}' is not configured for the '${TARGET_ENV}' GitHub Environment."
+            echo "::error::Add the GCP project number to the '${TARGET_ENV}' GitHub Environment secrets."
+            exit 1
+          fi
+          echo "GCP project number secret is set (length: ${#PROJECT_NUMBER})"
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.gcp.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: ${{ steps.gcp.outputs.deployer_sa }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ steps.gcp.outputs.project_id }}
+
+      - name: Resolve Cloud Run URL
+        id: url
+        env:
+          PROJECT_ID: ${{ steps.gcp.outputs.project_id }}
+        run: |
+          URL=$(gcloud run services describe <YOUR_SERVICE_NAME> \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format='value(status.url)')
+          echo "base_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "::notice::Target URL: $URL"
+
+      - name: Install K6
+        uses: grafana/setup-k6-action@ffe7d7290dfa715e48c2ccc924d068444c94bde2
+
+      - name: Run K6 scenario
+        env:
+          BASE_URL: ${{ steps.url.outputs.base_url }}
+          FIREBASE_API_KEY: ${{ secrets.YOUR_PERF_TEST_API_KEY }}
+          TEST_USER_EMAIL: ${{ secrets.YOUR_TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.YOUR_TEST_USER_PASSWORD }}
+        run: |
+          echo "Running scenario: $SCENARIO against $TARGET_ENV ($BASE_URL)"
+          cd Infrastructure/perf-tests
+          k6 run \
+            --out json=../../results.json \
+            --summary-export=../../summary.json \
+            --tag "env=$TARGET_ENV" \
+            "scenarios/${SCENARIO}.js"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: k6-results-${{ env.TARGET_ENV }}-${{ env.SCENARIO }}-${{ github.run_number }}
+          path: |
+            results.json
+            summary.json
+          retention-days: 30
+
+      - name: Post results summary
+        if: always()
+        run: |
+          if [ -f summary.json ]; then
+            {
+              echo "## K6 Performance Results"
+              echo ""
+              echo "**Environment:** $TARGET_ENV | **Scenario:** $SCENARIO"
+              echo ""
+              echo "### Metrics"
+              echo '```json'
+              python3 -c "
+          import json
+          with open('summary.json') as f:
+              data = json.load(f)
+          metrics = data.get('metrics', {})
+          summary = {}
+          metric_keys = [
+              'http_req_duration{phase:measure}',
+              'http_req_duration{phase:warmup}',
+              'http_req_duration',
+              'http_req_failed{phase:measure}',
+              'http_req_failed{phase:warmup}',
+              'http_req_failed',
+              'http_reqs',
+              'iterations',
+          ]
+          for key in metric_keys:
+              if key in metrics:
+                  m = metrics[key]
+                  if 'values' in m:
+                      summary[key] = {k: round(v, 2) if isinstance(v, float) else v for k, v in m['values'].items()}
+                  elif 'value' in m:
+                      value = m['value']
+                      summary[key] = round(value, 2) if isinstance(value, float) else value
+                  else:
+                      summary[key] = {
+                          k: round(v, 2) if isinstance(v, float) else v
+                          for k, v in m.items()
+                          if k != 'thresholds'
+                      }
+          print(json.dumps(summary, indent=2))
+          "
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::No summary.json found — K6 may have failed before producing output."
+          fi
