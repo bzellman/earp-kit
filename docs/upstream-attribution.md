@@ -29,6 +29,16 @@ This repo includes adapted workflow ideas, bundled skills, and plugin references
 - License in bundled source: MIT
 - How it is used here: included as a bundled system skill for PRD generation and issue publishing
 
+## iOS Simulator Skill
+
+- Original author: Conor Luddy
+- Upstream repo: https://github.com/conorluddy/ios-simulator-skill
+- Related upstream projects referenced in the bundled docs:
+  - https://github.com/conorluddy/xc-mcp
+  - https://github.com/conorluddy/xclaude-plugin
+- License in bundled source: MIT
+- How it is used here: included as a bundled iOS simulator automation skill with its original license and upstream README/docs retained in-tree
+
 ### Task Master dependency
 
 - Product docs: https://docs.task-master.dev/
@@ -39,4 +49,4 @@ This repo includes adapted workflow ideas, bundled skills, and plugin references
 
 - Keep this file or an equivalent credits section if you redistribute the repo or heavily adapt these components.
 - Preserve upstream LICENSE files for bundled components where they are included in-tree.
-- Avoid implying that Builder Methods, Jesse Vincent, anombyte93, or the Task Master project officially maintain or endorse this repo.
+- Avoid implying that Builder Methods, Jesse Vincent, Conor Luddy, anombyte93, or the Task Master project officially maintain or endorse this repo.

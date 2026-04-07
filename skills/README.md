@@ -18,7 +18,7 @@ These are installed at `~/.agentConfig/skills/` and available across all project
 | `find-skills` | "how do I", "find a skill" | Discovers and installs agent skills |
 | `gh-fix-ci` | Debug failing CI checks | Inspects GH Actions logs, diagnoses, drafts fix plan |
 | `ios-design` | SwiftUI design | Design system compliance with Apple HIG |
-| `ios-simulator-skill` | iOS simulator operations | Build, run, test on iOS simulators |
+| `ios-simulator-skill` | iOS simulator operations | Build, run, test on iOS simulators; bundled from `conorluddy/ios-simulator-skill` |
 | `microsoft-foundry` | Microsoft AI platform integration | Microsoft AI platform integration |
 | `openai-docs` | OpenAI API docs | Fetches up-to-date OpenAI documentation |
 | `pdf` | PDF files | Read, create, review PDFs with rendering |
