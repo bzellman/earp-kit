@@ -1,0 +1,364 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Database Migration Workflow - Raw SQL Runner
+# Applies SQL migration files from Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/.
+# Uses a schema_migrations tracking table instead of EF Core.
+#
+# Key improvements over previous version:
+# - Uses PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD instead of fragile regex parsing
+# - Wraps each migration in a transaction (migration + tracking insert are atomic)
+# - Uses psql variables to prevent SQL injection via filenames
+# - Explicit per-environment auth (no dynamic secret references)
+
+name: Database Migrations
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to migrate'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      action:
+        description: 'Migration action'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - status
+          - migrate
+          - dry-run
+          - ai-config-admin-hotfix
+
+concurrency:
+  group: db-migrate-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  REGION: 'us-central1'
+
+jobs:
+  migrate:
+    name: Run Migrations (${{ inputs.environment }} / ${{ inputs.action }})
+    runs-on: ubuntu-latest
+    # Actions that modify database state must attach to the target GitHub Environment
+    # so environment-scoped secrets and approvals are available.
+    environment: ${{ (inputs.action == 'migrate' || inputs.action == 'ai-config-admin-hotfix') && inputs.environment || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MIGRATION_ENV: ${{ inputs.environment }}
+      MIGRATION_ACTION: ${{ inputs.action }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve project config
+        id: config
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ inputs.environment }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.config.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::${{ steps.config.outputs.project_number_secret }} is not configured for the '${MIGRATION_ENV}' environment."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.config.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: ${{ steps.config.outputs.deployer_sa }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ steps.config.outputs.project_id }}
+
+      - name: Install Cloud SQL Proxy
+        run: |
+          CLOUD_SQL_PROXY_VERSION="2.14.1"
+          CLOUD_SQL_PROXY_SHA256="e48115261929445f468ae7ae86be199781bafda56837c9f33644892df8d46997"
+          curl -fsSLo cloud-sql-proxy "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v${CLOUD_SQL_PROXY_VERSION}/cloud-sql-proxy.linux.amd64"
+          echo "${CLOUD_SQL_PROXY_SHA256}  cloud-sql-proxy" | sha256sum --check --
+          chmod +x cloud-sql-proxy
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Get database credentials
+        id: db-creds
+        env:
+          PROJECT_ID: ${{ steps.config.outputs.project_id }}
+          DB_SECRET_NAME: ${{ steps.config.outputs.db_secret_name }}
+        run: |
+          RAW=$(gcloud secrets versions access latest \
+            --secret="$DB_SECRET_NAME" \
+            --project="$PROJECT_ID")
+          echo "::add-mask::$RAW"
+
+          # Parse .NET Npgsql connection string into individual PG env vars.
+          # Format: Host=...;Database=...;Username=...;Password=...
+          # Using individual vars is more robust than constructing a URI.
+          DB_HOST="localhost"
+          DB_PORT="5432"
+          DB_NAME=$(echo "$RAW" | tr ';' '\n' | grep -i '^Database=' | cut -d= -f2)
+          DB_USER=$(echo "$RAW" | tr ';' '\n' | grep -i '^Username=' | cut -d= -f2)
+          DB_PASS=$(echo "$RAW" | tr ';' '\n' | grep -i '^Password=' | cut -d= -f2-)
+
+          echo "::add-mask::$DB_PASS"
+
+          # Export as PG environment variables (used by psql automatically)
+          echo "PGHOST=$DB_HOST" >> $GITHUB_ENV
+          echo "PGPORT=$DB_PORT" >> $GITHUB_ENV
+          echo "PGDATABASE=$DB_NAME" >> $GITHUB_ENV
+          echo "PGUSER=$DB_USER" >> $GITHUB_ENV
+          # Password goes to output (masked) to avoid GITHUB_ENV log exposure
+          echo "db_pass=$DB_PASS" >> $GITHUB_OUTPUT
+
+      - name: Start Cloud SQL Proxy
+        env:
+          INSTANCE: ${{ steps.config.outputs.cloud_sql_instance }}
+        run: |
+          ./cloud-sql-proxy --port=5432 "$INSTANCE" &
+          sleep 5
+          echo "Cloud SQL Proxy started"
+
+      - name: Apply AI config admin hotfix
+        if: inputs.action == 'ai-config-admin-hotfix'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          BEFORE=$(psql -t -A -c "SELECT coalesce(to_regclass('public.ai_config_overrides')::text, ''), coalesce(to_regclass('public.ai_config_audit_log')::text, '');")
+          echo "Before: $BEFORE"
+
+          psql -v ON_ERROR_STOP=1 <<'EOSQL'
+          CREATE TABLE IF NOT EXISTS ai_config_overrides (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            config_section TEXT NOT NULL,
+            config_key TEXT NOT NULL,
+            config_value JSONB NOT NULL,
+            value_type TEXT NOT NULL,
+            description TEXT,
+            updated_by TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_active BOOLEAN NOT NULL DEFAULT TRUE
+          );
+
+          DO $$
+          BEGIN
+            IF NOT EXISTS (
+              SELECT 1
+              FROM pg_constraint
+              WHERE conname = 'ai_config_overrides_config_section_config_key_key'
+            ) THEN
+              ALTER TABLE ai_config_overrides
+                ADD CONSTRAINT ai_config_overrides_config_section_config_key_key
+                UNIQUE (config_section, config_key);
+            END IF;
+          END $$;
+
+          CREATE TABLE IF NOT EXISTS ai_config_audit_log (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            config_section TEXT NOT NULL,
+            config_key TEXT NOT NULL,
+            old_value JSONB,
+            new_value JSONB NOT NULL,
+            changed_by TEXT NOT NULL,
+            changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            change_reason TEXT
+          );
+
+          CREATE INDEX IF NOT EXISTS idx_ai_config_overrides_section ON ai_config_overrides(config_section);
+          CREATE INDEX IF NOT EXISTS idx_ai_config_overrides_active ON ai_config_overrides(is_active) WHERE is_active = TRUE;
+          CREATE INDEX IF NOT EXISTS idx_ai_config_audit_log_section ON ai_config_audit_log(config_section, changed_at DESC);
+          EOSQL
+          echo "Applied idempotent AI config admin hotfix SQL"
+
+          CONSTRAINT_COUNT=$(psql -t -A -c "SELECT COUNT(*) FROM pg_constraint WHERE conname = 'ai_config_overrides_config_section_config_key_key';")
+          INDEX_COUNT=$(psql -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('idx_ai_config_overrides_section', 'idx_ai_config_overrides_active', 'idx_ai_config_audit_log_section');")
+
+          if psql -t -A -c "SELECT coalesce(to_regclass('public.schema_migrations')::text, '');" | grep -qx 'schema_migrations'; then
+            if [ "$CONSTRAINT_COUNT" != "1" ] || [ "$INDEX_COUNT" != "3" ]; then
+              echo "Hotfix failed: expected admin config constraint/indexes to exist before tracking migration" >&2
+              exit 1
+            fi
+
+            CHECKSUM=$(sha256sum Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/014_AddAIConfigAdmin.sql | awk '{print $1}')
+            psql -v ON_ERROR_STOP=1 -c "INSERT INTO schema_migrations (filename, checksum) VALUES ('014_AddAIConfigAdmin.sql', '$CHECKSUM') ON CONFLICT (filename) DO NOTHING;"
+            echo "Tracked 014_AddAIConfigAdmin.sql"
+          else
+            echo "schema_migrations table not present; skipped tracking insert"
+          fi
+
+          AFTER=$(psql -t -A -c "SELECT coalesce(to_regclass('public.ai_config_overrides')::text, ''), coalesce(to_regclass('public.ai_config_audit_log')::text, '');")
+          echo "After: $AFTER"
+
+          if [ "$AFTER" != "ai_config_overrides|ai_config_audit_log" ]; then
+            echo "Hotfix failed: expected admin config tables to exist" >&2
+            exit 1
+          fi
+
+      - name: Create schema_migrations table
+        if: inputs.action != 'ai-config-admin-hotfix'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          psql <<'EOSQL'
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            filename TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            checksum TEXT NOT NULL
+          );
+          EOSQL
+
+      - name: Backfill tracking for manually-applied migrations
+        if: inputs.action != 'ai-config-admin-hotfix'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          # Migrations 001-015 were applied directly before the runner existed.
+          # Backfill tracking records so the runner skips them.
+          USERS_EXISTS=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'users';" | tr -d ' ')
+          if [ "$USERS_EXISTS" != "1" ]; then
+            echo "No tables found — fresh database, no backfill needed"
+            exit 0
+          fi
+
+          BACKFILL_FILES=(
+            001_InitialCreate.sql
+            002_AddFirebaseFields.sql
+            003_AddSocialNotificationsPrompts.sql
+            004_AddMediaEmbeddings.sql
+            005_AddShareLinks.sql
+            005_FixEntraObjectIdConstraint.sql
+            006_AddUserKnowledgeFacts.sql
+            007_AddGenerativeMedia.sql
+            008_MakeTitleOptionalAndReactions.sql
+            009_AddDynamicInsights.sql
+            010_AddInspirationCards.sql
+            011_AddMissions.sql
+            012_AddNewStylePresetsAndThumbnails.sql
+            013_AddTemplateToVideoStylePresets.sql
+            014_AddAIConfigAdmin.sql
+          )
+
+          BACKFILLED=0
+          for BASENAME in "${BACKFILL_FILES[@]}"; do
+            FILEPATH="Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/$BASENAME"
+            if [ ! -f "$FILEPATH" ]; then continue; fi
+            TRACKED=$(psql -t -c "SELECT COUNT(*) FROM schema_migrations WHERE filename = \$\$${BASENAME}\$\$;" | tr -d ' ')
+            if [ "$TRACKED" = "0" ]; then
+              CHECKSUM=$(sha256sum "$FILEPATH" | awk '{print $1}')
+              psql -c "INSERT INTO schema_migrations (filename, checksum) VALUES ('${BASENAME}', '${CHECKSUM}') ON CONFLICT (filename) DO NOTHING;"
+              echo "Backfilled: $BASENAME"
+              BACKFILLED=$((BACKFILLED + 1))
+            fi
+          done
+          echo "Backfilled $BACKFILLED migration tracking record(s)"
+
+      - name: Check migration status
+        if: inputs.action == 'status'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          echo "=== Applied Migrations ==="
+          psql -c "SELECT filename, applied_at FROM schema_migrations ORDER BY filename;"
+
+          echo ""
+          echo "=== Pending Migrations ==="
+          for f in $(ls Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/*.sql 2>/dev/null | sort); do
+            BASENAME=$(basename "$f")
+            APPLIED=$(psql -t -c "SELECT COUNT(*) FROM schema_migrations WHERE filename = \$\$${BASENAME}\$\$;" | tr -d ' ')
+            if [ "$APPLIED" = "0" ]; then
+              echo "  PENDING: $BASENAME"
+            fi
+          done
+
+      - name: Dry run migrations
+        if: inputs.action == 'dry-run'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          echo "=== Dry Run - SQL that would be applied ==="
+          PENDING=0
+          for f in $(ls Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/*.sql 2>/dev/null | sort); do
+            BASENAME=$(basename "$f")
+            APPLIED=$(psql -t -c "SELECT COUNT(*) FROM schema_migrations WHERE filename = \$\$${BASENAME}\$\$;" | tr -d ' ')
+            if [ "$APPLIED" = "0" ]; then
+              PENDING=$((PENDING + 1))
+              echo ""
+              echo "--- $BASENAME ---"
+              cat "$f"
+              echo ""
+            fi
+          done
+          echo ""
+          echo "Total pending: $PENDING migration(s)"
+
+      - name: Apply migrations
+        if: inputs.action == 'migrate'
+        env:
+          PGPASSWORD: ${{ steps.db-creds.outputs.db_pass }}
+        run: |
+          APPLIED_COUNT=0
+          FAILED=0
+
+          for f in $(ls Infrastructure/<YOUR_API_PROJECT>/Data/Migrations/*.sql 2>/dev/null | sort); do
+            BASENAME=$(basename "$f")
+            CHECKSUM=$(sha256sum "$f" | awk '{print $1}')
+
+            ALREADY=$(psql -t -c "SELECT COUNT(*) FROM schema_migrations WHERE filename = \$\$${BASENAME}\$\$;" | tr -d ' ')
+            if [ "$ALREADY" != "0" ]; then
+              echo "SKIP (already applied): $BASENAME"
+              continue
+            fi
+
+            echo "APPLYING: $BASENAME ..."
+
+            # Wrap migration + tracking insert in a transaction.
+            # If the migration SQL fails, the tracking insert is also rolled back.
+            if psql -v ON_ERROR_STOP=1 -v "mig_file=$BASENAME" -v "mig_checksum=$CHECKSUM" <<EOSQL
+          BEGIN;
+          \i $f
+          INSERT INTO schema_migrations (filename, checksum)
+            VALUES (:'mig_file', :'mig_checksum');
+          COMMIT;
+          EOSQL
+            then
+              echo "  OK"
+              APPLIED_COUNT=$((APPLIED_COUNT + 1))
+            else
+              echo "  FAILED: $BASENAME (transaction rolled back)"
+              FAILED=$((FAILED + 1))
+              break
+            fi
+          done
+
+          echo ""
+          echo "Applied: $APPLIED_COUNT, Failed: $FAILED"
+          if [ "$FAILED" -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Create summary
+        if: always()
+        env:
+          PROJECT_ID: ${{ steps.config.outputs.project_id }}
+        run: |
+          echo "## Database Migration Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | $MIGRATION_ENV |" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | $MIGRATION_ACTION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | $PROJECT_ID |" >> $GITHUB_STEP_SUMMARY

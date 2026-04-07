@@ -1,0 +1,131 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# iOS UI Smoke Tests
+# Non-blocking workflow focused on fast UI-surface validation.
+
+name: iOS UI Smoke Tests
+
+concurrency:
+  group: ios-ui-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '<YOUR_APP>/**'
+      - '!<YOUR_APP>/**.md'
+      - '.github/workflows/ios-ui-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  XCODE_VERSION: '26.3'
+  RUBY_VERSION: '3.2.11'
+  IOS_DESTINATION: 'platform=iOS Simulator,name=iPhone 17 Pro Max,OS=26.2'
+  FASTLANE_SKIP_UPDATE_CHECK: 'true'
+  FASTLANE_XCODE_LIST_TIMEOUT: '120'
+  FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: '120'
+
+jobs:
+  ui-smoke-tests:
+    name: Run UI Smoke Tests
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Xcode
+        uses: ./.github/actions/setup-xcode
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@e65c17d16e57e481586a6a5a0282698790062f92
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+
+      - name: Cache Gems
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: <YOUR_APP>/vendor/bundle
+          key: ${{ runner.os }}-gems-${{ env.XCODE_VERSION }}-${{ env.RUBY_VERSION }}-${{ hashFiles('<YOUR_APP>/Gemfile.lock') }}
+
+      - name: Install Fastlane dependencies
+        run: |
+          cd <YOUR_APP>
+          bundle config set path vendor/bundle
+          bundle install --jobs 4 --retry 3
+
+      - name: Configure simulator for UI tests
+        run: |
+          # Disable hardware keyboard so the software keyboard (and its accessory views) appear.
+          # Set the global preference first (covers future simulator boots).
+          defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool false
+
+          # Also configure the specific device — the global pref alone is unreliable
+          # on macOS 15 / Xcode 26.x runners. Filter by both device name AND OS version
+          # to match the exact simulator that Fastlane will boot.
+          DEVICE_ID=$(xcrun simctl list devices available -j \
+            | jq -r '[.devices | to_entries[] | select(.key | test("26[._-]2")) | .value[] | select(.name | test("iPhone 17 Pro Max")) | select(.isAvailable) | .udid] | first // empty' 2>/dev/null || true)
+
+          if [ -n "$DEVICE_ID" ]; then
+            echo "::group::Simulator keyboard configuration"
+            echo "Target device: $DEVICE_ID"
+            if xcrun simctl boot "$DEVICE_ID" 2>&1; then
+              echo "Device booted successfully"
+            else
+              echo "::warning::Device boot returned non-zero (may already be booted)"
+            fi
+            if xcrun simctl spawn "$DEVICE_ID" defaults write com.apple.Preferences UIKeyboardEnableHWKeyboard -bool false 2>&1; then
+              echo "Keyboard preference written to device"
+            else
+              echo "::warning::Failed to write keyboard preference to device"
+            fi
+            xcrun simctl shutdown "$DEVICE_ID" 2>/dev/null || true
+            echo "::endgroup::"
+          else
+            echo "::warning::Could not find iPhone 17 Pro Max (OS 26.2) simulator — keyboard preference not set on device"
+          fi
+
+      - name: Run UI Smoke Tests via Fastlane
+        id: ui-tests
+        continue-on-error: true
+        env:
+          IOS_DESTINATION: ${{ env.IOS_DESTINATION }}
+        run: |
+          cd <YOUR_APP>
+          bundle exec fastlane ios ci_ui_smoke_tests
+
+      - name: Retry UI Smoke Tests (once)
+        id: ui-tests-retry
+        if: steps.ui-tests.outcome == 'failure'
+        env:
+          IOS_DESTINATION: ${{ env.IOS_DESTINATION }}
+        run: |
+          cd <YOUR_APP>
+          bundle exec fastlane ios ci_ui_smoke_tests
+
+      - name: Upload UI Test Results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ios-ui-test-results
+          if-no-files-found: warn
+          path: |
+            <YOUR_APP>/fastlane/ui_test_output/junit.xml
+            <YOUR_APP>/fastlane/ui_test_output/*.xcresult
+            <YOUR_APP>/fastlane/ui_test_output/buildlogs

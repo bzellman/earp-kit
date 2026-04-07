@@ -1,0 +1,268 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Staging Promotion Workflow
+# Copies a tested image from dev Artifact Registry to staging and deploys.
+# Requires GitHub Environment approval gate.
+#
+# Usage:
+#   gh workflow run gcp-promote-staging.yml                          # auto-detect latest dev deploy
+#   gh workflow run gcp-promote-staging.yml -f image_digest=sha256:abc -f source_sha=abc1234  # explicit
+
+name: Promote to Staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Image digest from dev (sha256:...). Leave empty to use latest dev deploy.'
+        required: false
+        type: string
+        default: ''
+      source_sha:
+        description: 'Git commit SHA. Leave empty to use latest dev deploy.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  REGION: 'us-central1'
+  SERVICE_NAME: '<YOUR_SERVICE_NAME>'
+  AR_REPO: '<YOUR_SERVICE_NAME>'
+  DEV_PROJECT_ID: '<YOUR_GCP_PROJECT_DEV>'
+  STAGING_PROJECT_ID: '<YOUR_GCP_PROJECT_STAGING>'
+
+jobs:
+  resolve-inputs:
+    name: Resolve Inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      dev_image_ref: ${{ steps.resolve.outputs.dev_image_ref }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve image reference and SHA
+        id: resolve
+        env:
+          INPUT_DIGEST: ${{ inputs.image_digest }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$INPUT_DIGEST" ] && [ -n "$INPUT_SHA" ]; then
+            echo "Using provided inputs"
+            echo "source_sha=$INPUT_SHA" >> $GITHUB_OUTPUT
+            echo "dev_image_ref=$REGION-docker.pkg.dev/$DEV_PROJECT_ID/$AR_REPO/$SERVICE_NAME@$INPUT_DIGEST" >> $GITHUB_OUTPUT
+          else
+            echo "Auto-detecting from latest successful dev deploy..."
+            RUN_JSON=$(gh run list -w "Deploy to Dev" --status=success -L 1 --json databaseId,headSha)
+            SHA=$(echo "$RUN_JSON" | jq -r '.[0].headSha')
+
+            if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+              echo "::error::No successful 'Deploy to Dev' run found. Provide inputs manually."
+              exit 1
+            fi
+
+            echo "Resolved from latest dev deploy: SHA=$SHA"
+            echo "source_sha=$SHA" >> $GITHUB_OUTPUT
+
+            if [ -n "$INPUT_DIGEST" ]; then
+              echo "dev_image_ref=$REGION-docker.pkg.dev/$DEV_PROJECT_ID/$AR_REPO/$SERVICE_NAME@$INPUT_DIGEST" >> $GITHUB_OUTPUT
+            else
+              # Dev deploy tags images with the git SHA
+              echo "dev_image_ref=$REGION-docker.pkg.dev/$DEV_PROJECT_ID/$AR_REPO/$SERVICE_NAME:$SHA" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  copy-image:
+    name: Copy Image to Staging AR
+    runs-on: ubuntu-latest
+    needs: [resolve-inputs]
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      staging_image: ${{ steps.copy.outputs.staging_image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Authenticate to Google Cloud (staging)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets.YOUR_STAGING_GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '<YOUR_DEPLOYER_SA>@${{ env.STAGING_PROJECT_ID }}.iam.gserviceaccount.com'
+          token_format: 'access_token'
+
+      - name: Install crane
+        uses: ./.github/actions/install-crane
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "$REGION-docker.pkg.dev"
+
+      - name: Validate source image exists
+        env:
+          DEV_IMAGE: ${{ needs.resolve-inputs.outputs.dev_image_ref }}
+        run: |
+          echo "Validating source image: $DEV_IMAGE"
+          if ! crane manifest "$DEV_IMAGE" > /dev/null 2>&1; then
+            echo "::error::Source image not found in dev AR: $DEV_IMAGE"
+            echo "Ensure the image was built and pushed by the Deploy to Dev workflow."
+            echo "If the staging SA lacks cross-project AR read access, grant roles/artifactregistry.reader via Terraform."
+            exit 1
+          fi
+          echo "Source image validated."
+
+      - name: Copy image from dev to staging
+        id: copy
+        env:
+          DEV_IMAGE: ${{ needs.resolve-inputs.outputs.dev_image_ref }}
+          SOURCE_SHA: ${{ needs.resolve-inputs.outputs.source_sha }}
+        run: |
+          STAGING_IMAGE="$REGION-docker.pkg.dev/$STAGING_PROJECT_ID/$AR_REPO/$SERVICE_NAME:$SOURCE_SHA"
+
+          echo "Copying $DEV_IMAGE -> $STAGING_IMAGE"
+          crane copy "$DEV_IMAGE" "$STAGING_IMAGE"
+
+          STAGING_LATEST="$REGION-docker.pkg.dev/$STAGING_PROJECT_ID/$AR_REPO/$SERVICE_NAME:latest"
+          crane copy "$DEV_IMAGE" "$STAGING_LATEST"
+
+          echo "staging_image=$STAGING_IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Copy OTel Collector sidecar to staging
+        run: |
+          DEV_COLLECTOR="$REGION-docker.pkg.dev/$DEV_PROJECT_ID/$AR_REPO/otel-collector:latest"
+          STAGING_COLLECTOR="$REGION-docker.pkg.dev/$STAGING_PROJECT_ID/$AR_REPO/otel-collector:latest"
+          if crane manifest "$DEV_COLLECTOR" > /dev/null 2>&1; then
+            echo "Copying collector sidecar to staging"
+            crane copy "$DEV_COLLECTOR" "$STAGING_COLLECTOR"
+          else
+            echo "No collector sidecar image found in dev, skipping"
+          fi
+
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [resolve-inputs, copy-image]
+    environment: staging
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}
+
+      - name: Authenticate to Google Cloud (staging)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets.YOUR_STAGING_GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '<YOUR_DEPLOYER_SA>@${{ env.STAGING_PROJECT_ID }}.iam.gserviceaccount.com'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ env.STAGING_PROJECT_ID }}
+
+      - name: Deploy to Cloud Run
+        env:
+          GCP_PROJECT_ID: ${{ env.STAGING_PROJECT_ID }}
+          PRIMARY_IMAGE: ${{ needs.copy-image.outputs.staging_image }}
+          COLLECTOR_IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.STAGING_PROJECT_ID }}/${{ env.AR_REPO }}/otel-collector:latest
+        run: |
+          ./.github/scripts/deploy_cloud_run_service.sh
+
+      - name: Smoke test
+        uses: ./.github/actions/smoke-test
+        with:
+          service_name: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          source_sha: ${{ needs.resolve-inputs.outputs.source_sha }}
+
+      - name: Check for Terraform drift (OTel sidecar dependency)
+        continue-on-error: true
+        env:
+          GCP_PROJECT_ID: ${{ env.STAGING_PROJECT_ID }}
+          ENVIRONMENT_NAME: staging
+          EXPECTED_COLLECTOR_IMAGE: ${{ env.REGION }}-docker.pkg.dev/${{ env.STAGING_PROJECT_ID }}/${{ env.AR_REPO }}/otel-collector:latest
+        run: |
+          ./.github/scripts/check_cloud_run_otel_sidecar.sh
+
+      - name: Check for IAM drift (Cloud Run SA roles)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          # Get the service account used by Cloud Run
+          SA_EMAIL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" \
+            --format='value(spec.template.spec.serviceAccountName)')
+
+          if [ -z "$SA_EMAIL" ]; then
+            echo "::warning::Could not determine Cloud Run service account"
+            exit 0
+          fi
+
+          # Critical IAM roles the Cloud Run SA must have (from modules/cloud-run/main.tf)
+          REQUIRED_ROLES=(
+            "roles/cloudsql.client"
+            "roles/secretmanager.secretAccessor"
+            "roles/storage.objectAdmin"
+            "roles/aiplatform.user"
+          )
+
+          ACTUAL_ROLES=$(gcloud projects get-iam-policy "$STAGING_PROJECT_ID" \
+            --flatten="bindings[].members" \
+            --filter="bindings.members:${SA_EMAIL}" \
+            --format='value(bindings.role)' | sort -u)
+
+          MISSING=0
+          for role in "${REQUIRED_ROLES[@]}"; do
+            if ! echo "$ACTUAL_ROLES" | grep -q "^${role}$"; then
+              echo "::error::IAM drift: Cloud Run SA ($SA_EMAIL) is missing $role in staging. Fix: gcloud projects add-iam-policy-binding $STAGING_PROJECT_ID --member=serviceAccount:$SA_EMAIL --role=$role"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::$MISSING critical IAM role(s) missing in staging. Run: gh workflow run gcp-terraform.yml -f environment=staging -f action=apply"
+            exit 1
+          fi
+
+          echo "IAM drift check passed: all ${#REQUIRED_ROLES[@]} critical roles present on $SA_EMAIL"
+
+      - name: Deployment summary
+        env:
+          DEV_IMAGE: ${{ needs.resolve-inputs.outputs.dev_image_ref }}
+          SOURCE_SHA: ${{ needs.resolve-inputs.outputs.source_sha }}
+        run: |
+          URL=$(gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" \
+            --format='value(status.url)')
+          REVISION=$(gcloud run services describe "$SERVICE_NAME" \
+            --region="$REGION" \
+            --format='value(status.latestReadyRevisionName)')
+          echo "## Staging Promotion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| Project | $STAGING_PROJECT_ID |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revision | $REVISION |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Image | $DEV_IMAGE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source Commit | $SOURCE_SHA |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | $URL |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Update API endpoints file
+        uses: ./.github/actions/update-api-endpoints
+        with:
+          environment: staging
+          service_name: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          commit_sha: ${{ needs.resolve-inputs.outputs.source_sha }}
+          target_branch: ${{ github.event_name == 'workflow_dispatch' && github.ref_name || 'main' }}

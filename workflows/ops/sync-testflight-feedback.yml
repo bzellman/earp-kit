@@ -1,0 +1,37 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+name: Sync TestFlight Feedback & Crashes
+
+on:
+  workflow_dispatch:         # Manual trigger
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sync-feedback:
+    name: Sync TestFlight Feedback
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          sparse-checkout: .github
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install PyJWT cryptography
+
+      - name: Sync TestFlight data to GitHub Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASC_KEY_ID: ${{ secrets.YOUR_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.YOUR_ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.YOUR_ASC_PRIVATE_KEY }}
+          YOUR_APPLE_APP_ID: ${{ secrets.YOUR_APPLE_APP_ID }}
+        run: python3 .github/scripts/sync-testflight.py

@@ -1,0 +1,86 @@
+name: Update API Endpoints File
+description: Update a tracked API endpoints JSON file with the latest Cloud Run URL.
+
+inputs:
+  environment:
+    description: Target environment key inside the JSON file
+    required: true
+  service_name:
+    description: Cloud Run service name
+    required: true
+  region:
+    description: Cloud Run region
+    required: true
+  commit_sha:
+    description: Source commit SHA associated with the deployment
+    required: true
+  target_branch:
+    description: Branch to push documentation updates to
+    required: true
+  file_path:
+    description: Path to the API endpoints JSON file
+    required: false
+    default: Infrastructure/docs/api-endpoints.json
+  push_changes:
+    description: Push the updated file back to the repository
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        FILE_PATH="${{ inputs.file_path }}"
+        if [ ! -f "$FILE_PATH" ]; then
+          echo "::notice::${FILE_PATH} not found; skipping endpoint update."
+          exit 0
+        fi
+
+        SERVICE_URL="$(gcloud run services describe "${{ inputs.service_name }}" \
+          --region="${{ inputs.region }}" \
+          --format='value(status.url)')"
+
+        if [ -z "$SERVICE_URL" ]; then
+          echo "::error::Unable to resolve URL for service '${{ inputs.service_name }}'"
+          exit 1
+        fi
+
+        python3 - "$FILE_PATH" "${{ inputs.environment }}" "$SERVICE_URL" "${{ inputs.commit_sha }}" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+path = Path(sys.argv[1])
+environment = sys.argv[2]
+base_url = sys.argv[3]
+commit_sha = sys.argv[4]
+
+data = json.loads(path.read_text(encoding="utf-8"))
+environments = data.setdefault("environments", {})
+env_doc = environments.setdefault(environment, {})
+env_doc["baseUrl"] = base_url
+env_doc["serviceName"] = env_doc.get("serviceName", "<YOUR_SERVICE_NAME>")
+env_doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
+env_doc["commitSha"] = commit_sha
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+
+        if git diff --quiet -- "$FILE_PATH"; then
+          echo "API endpoint file already up to date."
+          exit 0
+        fi
+
+        if [ "${{ inputs.push_changes }}" != "true" ]; then
+          echo "::notice::API endpoint file updated locally but push_changes=false."
+          exit 0
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add "$FILE_PATH"
+        git commit -m "docs: update API endpoints for ${{ inputs.environment }}"
+        git push origin "HEAD:${{ inputs.target_branch }}"

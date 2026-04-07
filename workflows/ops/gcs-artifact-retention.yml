@@ -1,0 +1,104 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# Apply lifecycle retention to Cloud Build and run-sources buckets.
+
+name: GCS Artifact Retention
+
+on:
+  schedule:
+    - cron: '30 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to target'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      mode:
+        description: 'Plan or apply'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - plan
+          - apply
+      retention_days:
+        description: 'Delete objects older than this many days'
+        required: true
+        default: '30'
+        type: string
+
+concurrency:
+  group: gcs-artifact-retention-${{ github.event_name == 'schedule' && 'dev' || inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  retain:
+    name: Artifact Retention (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: ${{ github.event_name == 'schedule' && fromJSON('["dev"]') || fromJSON(format('["{0}"]', inputs.environment)) }}
+    env:
+      TARGET_ENV: ${{ matrix.environment }}
+      RETENTION_MODE: ${{ github.event_name == 'schedule' && 'apply' || inputs.mode }}
+      RETENTION_DAYS: ${{ github.event_name == 'schedule' && '30' || inputs.retention_days }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+
+      - name: Resolve GCP project config
+        id: gcp
+        uses: ./.github/actions/gcp-project-config
+        with:
+          environment: ${{ env.TARGET_ENV }}
+
+      - name: Validate GCP project number secret
+        env:
+          PROJECT_NUMBER: ${{ secrets[steps.gcp.outputs.project_number_secret] }}
+        run: |
+          if [ -z "$PROJECT_NUMBER" ]; then
+            echo "::error::${{ steps.gcp.outputs.project_number_secret }} is not configured for the '$TARGET_ENV' environment."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets[steps.gcp.outputs.project_number_secret] }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: ${{ steps.gcp.outputs.terraform_sa }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db
+        with:
+          project_id: ${{ steps.gcp.outputs.project_id }}
+
+      - name: Plan or apply artifact retention
+        run: |
+          python3 .github/scripts/enforce_artifact_retention.py \
+            --project-id "${{ steps.gcp.outputs.project_id }}" \
+            --mode "$RETENTION_MODE" \
+            --retention-days "$RETENTION_DAYS" | tee retention_output.txt
+
+      - name: Publish workflow summary
+        run: |
+          echo "## GCS Artifact Retention" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Environment: \`$TARGET_ENV\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Mode: \`$RETENTION_MODE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Retention days: \`$RETENTION_DAYS\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat retention_output.txt >> "$GITHUB_STEP_SUMMARY"

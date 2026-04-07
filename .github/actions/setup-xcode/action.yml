@@ -1,0 +1,26 @@
+name: Setup Xcode
+description: Select a requested Xcode version when available on the runner.
+
+inputs:
+  xcode-version:
+    description: Desired Xcode version (for example 16.4)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        REQUESTED="${{ inputs.xcode-version }}"
+        CANDIDATE="/Applications/Xcode_${REQUESTED}.app/Contents/Developer"
+
+        if [ -d "$CANDIDATE" ]; then
+          sudo xcode-select -s "$CANDIDATE"
+        else
+          CURRENT="$(xcodebuild -version | head -1 | awk '{print $2}')"
+          echo "::warning::Requested Xcode ${REQUESTED} was not found. Using ${CURRENT}."
+        fi
+
+        xcodebuild -version

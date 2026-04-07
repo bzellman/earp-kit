@@ -1,0 +1,38 @@
+name: Install Crane
+description: Download crane from a pinned release with checksum verification.
+
+inputs:
+  version:
+    description: go-containerregistry release tag
+    required: false
+    default: v0.20.5
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        VERSION="${{ inputs.version }}"
+        ARCHIVE="go-containerregistry_Linux_x86_64.tar.gz"
+        BASE_URL="https://github.com/google/go-containerregistry/releases/download/${VERSION}"
+        CHECKSUMS="/tmp/crane-checksums.txt"
+        TARBALL="/tmp/${ARCHIVE}"
+
+        curl -fsSLo "$CHECKSUMS" "${BASE_URL}/checksums.txt"
+        curl -fsSLo "$TARBALL" "${BASE_URL}/${ARCHIVE}"
+
+        EXPECTED_SHA="$(awk '/go-containerregistry_Linux_x86_64\.tar\.gz$/ { print $1 }' "$CHECKSUMS")"
+        if [ -z "$EXPECTED_SHA" ]; then
+          echo "::error::Unable to resolve checksum for ${ARCHIVE}"
+          exit 1
+        fi
+
+        echo "${EXPECTED_SHA}  ${TARBALL}" | sha256sum --check --
+
+        mkdir -p "$HOME/.local/bin"
+        tar -xzf "$TARBALL" -C /tmp crane
+        install -m 0755 /tmp/crane "$HOME/.local/bin/crane"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/crane" version

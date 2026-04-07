@@ -1,0 +1,72 @@
+name: Smoke Test Cloud Run Service
+description: Resolve a Cloud Run URL and retry a basic health check.
+
+inputs:
+  service_name:
+    description: Cloud Run service name
+    required: true
+  region:
+    description: Cloud Run region
+    required: true
+  path:
+    description: Relative health-check path
+    required: false
+    default: /health
+  max_retries:
+    description: Maximum retry attempts
+    required: false
+    default: "10"
+  retry_interval:
+    description: Seconds between retries
+    required: false
+    default: "5"
+  source_sha:
+    description: Optional source SHA for logging
+    required: false
+    default: ""
+
+outputs:
+  service_url:
+    description: Resolved Cloud Run URL
+    value: ${{ steps.smoke.outputs.service_url }}
+  target_url:
+    description: Final target URL that was checked
+    value: ${{ steps.smoke.outputs.target_url }}
+
+runs:
+  using: composite
+  steps:
+    - id: smoke
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        SERVICE_URL="$(gcloud run services describe "${{ inputs.service_name }}" \
+          --region="${{ inputs.region }}" \
+          --format='value(status.url)')"
+
+        if [ -z "$SERVICE_URL" ]; then
+          echo "::error::Unable to resolve a URL for service '${{ inputs.service_name }}'"
+          exit 1
+        fi
+
+        TARGET_URL="${SERVICE_URL%/}${{ inputs.path }}"
+        echo "service_url=${SERVICE_URL}" >> "$GITHUB_OUTPUT"
+        echo "target_url=${TARGET_URL}" >> "$GITHUB_OUTPUT"
+
+        for attempt in $(seq 1 "${{ inputs.max_retries }}"); do
+          STATUS="$(curl -sS -o /tmp/smoke-response.txt -w '%{http_code}' "$TARGET_URL" || true)"
+          if [[ "$STATUS" =~ ^(2|3) ]]; then
+            echo "Smoke test passed for $TARGET_URL"
+            exit 0
+          fi
+
+          echo "Attempt ${attempt}/${{ inputs.max_retries }} failed with status '${STATUS:-curl_error}' for $TARGET_URL"
+          sleep "${{ inputs.retry_interval }}"
+        done
+
+        echo "::error::Smoke test failed for $TARGET_URL"
+        if [ -f /tmp/smoke-response.txt ]; then
+          cat /tmp/smoke-response.txt
+        fi
+        exit 1

@@ -1,0 +1,260 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# CI Gates - Unified PR Check
+# Single entry point for all PR validation. Detects which parts of the
+# codebase changed and runs relevant checks. The ci-passed job is the
+# single required status check for branch protection.
+#
+# Terraform plan is inlined (not delegated via workflow_call) because
+# environment-scoped secrets cannot be passed through workflow_call.
+# See: https://github.com/actions/runner/issues/3379
+
+name: CI Gates
+
+concurrency:
+  group: ci-gates-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      ios: ${{ steps.filter.outputs.ios }}
+      terraform: ${{ steps.filter.outputs.terraform }}
+      secret_drift: ${{ steps.filter.outputs.secret_drift }}
+      backend_reason: ${{ steps.filter.outputs.backend_reason }}
+      ios_reason: ${{ steps.filter.outputs.ios_reason }}
+      terraform_reason: ${{ steps.filter.outputs.terraform_reason }}
+      secret_drift_reason: ${{ steps.filter.outputs.secret_drift_reason }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -E '^Infrastructure/<YOUR_API_PROJECT>/|^Infrastructure/<YOUR_API_PROJECT>\.Tests/' | grep -qvE '\.md$'; then
+            echo "backend=true" >> $GITHUB_OUTPUT
+            echo "backend_reason=Detected non-markdown changes in Infrastructure/<YOUR_API_PROJECT> or Infrastructure/<YOUR_API_PROJECT>.Tests" >> $GITHUB_OUTPUT
+          else
+            echo "backend=false" >> $GITHUB_OUTPUT
+            echo "backend_reason=No non-markdown changes under Infrastructure/<YOUR_API_PROJECT> or Infrastructure/<YOUR_API_PROJECT>.Tests" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -E '^<YOUR_APP>/' | grep -qvE '\.md$'; then
+            echo "ios=true" >> $GITHUB_OUTPUT
+            echo "ios_reason=Detected non-markdown changes in <YOUR_APP> app sources" >> $GITHUB_OUTPUT
+          else
+            echo "ios=false" >> $GITHUB_OUTPUT
+            echo "ios_reason=No non-markdown changes under <YOUR_APP>/" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -qE '^Infrastructure/terraform/'; then
+            echo "terraform=true" >> $GITHUB_OUTPUT
+            echo "terraform_reason=Detected terraform changes under Infrastructure/terraform" >> $GITHUB_OUTPUT
+          else
+            echo "terraform=false" >> $GITHUB_OUTPUT
+            echo "terraform_reason=No terraform changes detected" >> $GITHUB_OUTPUT
+          fi
+
+          if echo "$CHANGED" | grep -E '^Infrastructure/<YOUR_API_PROJECT>/|^Infrastructure/<YOUR_API_PROJECT>\.Tests/' | grep -qvE '\.md$' || \
+             echo "$CHANGED" | grep -qE '^Infrastructure/terraform/|^Infrastructure/scripts/check-secret-drift\.sh$|^Infrastructure/scripts/secret-drift-allowlist\.txt$|^\.github/workflows/ci-gates\.yml$'; then
+            echo "secret_drift=true" >> $GITHUB_OUTPUT
+            echo "secret_drift_reason=Detected drift-guard source changes in backend code, terraform, drift scripts, or ci-gates workflow" >> $GITHUB_OUTPUT
+          else
+            echo "secret_drift=false" >> $GITHUB_OUTPUT
+            echo "secret_drift_reason=No drift-guard source changes detected" >> $GITHUB_OUTPUT
+          fi
+
+  ci-decision-summary:
+    name: CI Decision Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    steps:
+      - name: Publish CI routing decisions
+        run: |
+          {
+            echo "## CI Routing Decisions"
+            echo ""
+            echo "- Backend tests: ${{ needs.detect-changes.outputs.backend }}"
+            echo "  - Reason: ${{ needs.detect-changes.outputs.backend_reason }}"
+            echo "- iOS tests: ${{ needs.detect-changes.outputs.ios }}"
+            echo "  - Reason: ${{ needs.detect-changes.outputs.ios_reason }}"
+            echo "- Terraform plan: ${{ needs.detect-changes.outputs.terraform }}"
+            echo "  - Reason: ${{ needs.detect-changes.outputs.terraform_reason }}"
+            echo "- Secret drift: ${{ needs.detect-changes.outputs.secret_drift }}"
+            echo "  - Reason: ${{ needs.detect-changes.outputs.secret_drift_reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  backend-tests:
+    name: Backend Tests
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.backend == 'true'
+    uses: ./.github/workflows/backend-tests.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+
+  ios-tests:
+    name: iOS Tests
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.ios == 'true'
+    uses: ./.github/workflows/ios-tests.yml
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+
+  terraform-plan:
+    name: Terraform Plan (dev)
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    environment: dev
+    defaults:
+      run:
+        working-directory: Infrastructure/terraform/environments/dev
+    env:
+      TF_VERSION: '1.6.0'
+      TF_VAR_region: 'us-central1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: 'projects/${{ secrets.YOUR_DEV_GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+          service_account: '<YOUR_TERRAFORM_SA>@<YOUR_GCP_PROJECT_DEV>.iam.gserviceaccount.com'
+
+      - name: Install Terraform
+        env:
+          TF_VERSION: ${{ env.TF_VERSION }}
+        run: |
+          set -euo pipefail
+          base_url="https://releases.hashicorp.com/terraform/${TF_VERSION}"
+          curl -fsSLo /tmp/terraform.zip "${base_url}/terraform_${TF_VERSION}_linux_amd64.zip"
+          curl -fsSLo /tmp/terraform_SHA256SUMS "${base_url}/terraform_${TF_VERSION}_SHA256SUMS"
+          expected_sha="$(grep "terraform_${TF_VERSION}_linux_amd64.zip" /tmp/terraform_SHA256SUMS | awk '{print $1}')"
+          echo "${expected_sha}  /tmp/terraform.zip" | sha256sum --check --
+          unzip -q /tmp/terraform.zip -d /tmp/terraform-bin
+          echo "/tmp/terraform-bin" >> "$GITHUB_PATH"
+          /tmp/terraform-bin/terraform version
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -backend-config="bucket=<YOUR_TF_STATE_BUCKET>-dev"
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -input=false -var="project_id=<YOUR_GCP_PROJECT_DEV>" 2>&1 | tee plan_output.txt
+
+      - name: Comment PR with Plan
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          TF_INIT: ${{ steps.init.outcome }}
+          TF_VALIDATE: ${{ steps.validate.outcome }}
+          TF_PLAN: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            let plan = '';
+            try {
+              plan = fs.readFileSync('Infrastructure/terraform/environments/dev/plan_output.txt', 'utf8');
+            } catch (e) {
+              plan = 'Plan output not available';
+            }
+            if (plan.length > 60000) {
+              plan = plan.substring(0, 60000) + '\n... (truncated)';
+            }
+            const body = [
+              '### Terraform Plan - dev',
+              '',
+              `**Init:** ${process.env.TF_INIT}`,
+              `**Validate:** ${process.env.TF_VALIDATE}`,
+              `**Plan:** ${process.env.TF_PLAN}`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```',
+              plan,
+              '```',
+              '',
+              '</details>'
+            ].join('\n');
+
+            const prNumber = context.payload.pull_request?.number;
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
+
+  secret-drift:
+    name: Secret Drift Check
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.secret_drift == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Check for secret drift
+        run: bash Infrastructure/scripts/check-secret-drift.sh
+
+  ci-passed:
+    name: CI Passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [detect-changes, ci-decision-summary, backend-tests, ios-tests, terraform-plan, secret-drift]
+    steps:
+      - name: Evaluate results
+        env:
+          BACKEND_RESULT: ${{ needs.backend-tests.result }}
+          IOS_RESULT: ${{ needs.ios-tests.result }}
+          TF_RESULT: ${{ needs.terraform-plan.result }}
+          DRIFT_RESULT: ${{ needs.secret-drift.result }}
+        run: |
+          echo "Backend:      $BACKEND_RESULT"
+          echo "iOS:          $IOS_RESULT"
+          echo "Terraform:    $TF_RESULT"
+          echo "Secret Drift: $DRIFT_RESULT"
+
+          FAILED=false
+          for result in "$BACKEND_RESULT" "$IOS_RESULT" "$TF_RESULT" "$DRIFT_RESULT"; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              FAILED=true
+            fi
+          done
+
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::One or more required checks failed"
+            exit 1
+          fi
+
+          echo "All required checks passed (or were correctly skipped)."

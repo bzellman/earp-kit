@@ -1,0 +1,231 @@
+# TEMPLATE: Replace project-specific paths and values marked with <YOUR_*> placeholders.
+# Project paths (<YOUR_APP>/, <YOUR_API_PROJECT>/, Infrastructure/) should be adapted to your repo structure.
+
+# iOS Tests
+# Fastlane-driven iOS unit-test workflow for CI and main-branch validation.
+
+name: iOS Tests
+
+concurrency:
+  group: ios-tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '<YOUR_APP>/**'
+      - '!<YOUR_APP>/**.md'
+      - '.github/workflows/ios-tests.yml'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: string
+
+env:
+  XCODE_VERSION: '26.3'
+  RUBY_VERSION: '3.2.11'
+  IOS_DESTINATION: 'platform=iOS Simulator,name=iPhone 17 Pro Max,OS=26.2'
+  FASTLANE_SKIP_UPDATE_CHECK: 'true'
+  FASTLANE_XCODE_LIST_TIMEOUT: '120'
+  FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT: '120'
+
+jobs:
+  test:
+    name: Run iOS Unit Tests
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Xcode
+        uses: ./.github/actions/setup-xcode
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@e65c17d16e57e481586a6a5a0282698790062f92
+        with:
+          ruby-version: ${{ env.RUBY_VERSION }}
+
+      - name: Cache Gems
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: <YOUR_APP>/vendor/bundle
+          key: ${{ runner.os }}-gems-${{ env.XCODE_VERSION }}-${{ env.RUBY_VERSION }}-${{ hashFiles('<YOUR_APP>/Gemfile.lock') }}
+
+      - name: Install Fastlane dependencies
+        run: |
+          cd <YOUR_APP>
+          bundle config set path vendor/bundle
+          bundle install --jobs 4 --retry 3
+
+      - name: Run Unit Tests via Fastlane
+        id: unit-tests
+        continue-on-error: true
+        env:
+          IOS_DESTINATION: ${{ env.IOS_DESTINATION }}
+        run: |
+          cd <YOUR_APP>
+          bundle exec fastlane ios ci_unit_tests
+
+      - name: Classify Unit Test Failure
+        if: steps.unit-tests.outcome == 'failure'
+        id: unit-failure-classifier
+        shell: bash
+        run: |
+          cd <YOUR_APP>
+
+          infra_retry=false
+          log_candidates=()
+          while IFS= read -r log_file; do
+            log_candidates+=("$log_file")
+          done < <(find fastlane/test_output -type f -name '*.log' | sort)
+
+          if [ "${#log_candidates[@]}" -eq 0 ]; then
+            echo "No test logs found after failed unit-test attempt"
+          elif grep -E \
+            "NSMachErrorDomain Code=-308|server died|IDELaunchParametersSnapshot|DebuggerLLDB\\.DebuggerVersionStore\\.StoreError|Failed to launch app with identifier" \
+            "${log_candidates[@]}" >/dev/null 2>&1; then
+            infra_retry=true
+            echo "Detected simulator/test-host infrastructure failure signature"
+            grep -n -E \
+              "NSMachErrorDomain Code=-308|server died|IDELaunchParametersSnapshot|DebuggerLLDB\\.DebuggerVersionStore\\.StoreError|Failed to launch app with identifier" \
+              "${log_candidates[@]}" | tail -n 40 || true
+          else
+            echo "Unit-test failure did not match known simulator infrastructure signatures"
+          fi
+
+          echo "infra_retry=${infra_retry}" >> "$GITHUB_OUTPUT"
+
+      - name: Reset Simulators After Infra Failure
+        if: steps.unit-failure-classifier.outputs.infra_retry == 'true'
+        shell: bash
+        run: |
+          xcrun simctl shutdown all || true
+          xcrun simctl erase all || true
+
+      - name: Retry Unit Tests via Fastlane
+        if: steps.unit-failure-classifier.outputs.infra_retry == 'true'
+        id: unit-tests-retry
+        env:
+          IOS_DESTINATION: ${{ env.IOS_DESTINATION }}
+        run: |
+          cd <YOUR_APP>
+          bundle exec fastlane ios ci_unit_tests
+
+      - name: Enforce Unit Test Outcome
+        if: always()
+        shell: bash
+        run: |
+          first_outcome="${{ steps.unit-tests.outcome }}"
+          retry_requested="${{ steps.unit-failure-classifier.outputs.infra_retry }}"
+          retry_outcome="${{ steps.unit-tests-retry.outcome }}"
+
+          if [ "$first_outcome" = "success" ]; then
+            echo "Initial unit-test run passed"
+            exit 0
+          fi
+
+          if [ "$retry_requested" = "true" ] && [ "$retry_outcome" = "success" ]; then
+            echo "Unit-test retry passed after simulator reset"
+            exit 0
+          fi
+
+          if [ "$retry_requested" = "true" ]; then
+            echo "::error::iOS unit tests still failed after retrying a simulator infrastructure failure"
+          else
+            echo "::error::iOS unit tests failed without a recognized simulator infrastructure signature"
+          fi
+          exit 1
+
+      - name: Generate Coverage Report
+        if: success()
+        continue-on-error: true
+        run: |
+          RESULT_BUNDLE="<YOUR_APP>/fastlane/test_output/<YOUR_APP>Tests.xcresult"
+          if [ -d "$RESULT_BUNDLE" ]; then
+            xcrun xccov view --report --json "$RESULT_BUNDLE" > <YOUR_APP>/coverage.json
+            COVERAGE=$(jq '.lineCoverage // 0' <YOUR_APP>/coverage.json | awk '{printf "%.1f", $1 * 100}')
+            echo "Code Coverage: ${COVERAGE}%"
+            echo "COVERAGE_PERCENT=${COVERAGE}" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No xcresult bundle found; skipping coverage"
+            echo "COVERAGE_PERCENT=N/A" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: ios-test-results
+          if-no-files-found: warn
+          path: |
+            <YOUR_APP>/fastlane/test_output/junit.xml
+            <YOUR_APP>/fastlane/test_output/<YOUR_APP>Tests.xcresult
+            <YOUR_APP>/fastlane/test_output/buildlogs
+            <YOUR_APP>/coverage.json
+
+      - name: Comment PR with Coverage
+        if: inputs.pr_number != ''
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        with:
+          script: |
+            const coverage = process.env.COVERAGE_PERCENT || 'N/A';
+            const coverageFloat = parseFloat(coverage) || 0;
+            let status = 'N/A';
+            if (coverage !== 'N/A') {
+              status = coverageFloat >= 75 ? 'Passing' :
+                       coverageFloat >= 60 ? 'Warning' : 'Below Target';
+            }
+
+            const body = [
+              '## iOS Test Results',
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Coverage | ${coverage}${coverage !== 'N/A' ? '%' : ''} |`,
+              '| Target | 75% |',
+              `| Status | ${status} |`,
+              '',
+              'View the full test report in the Actions tab.'
+            ].join('\n');
+
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            if (prNumber) {
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
+
+      - name: Check Coverage Threshold
+        run: |
+          COVERAGE="${COVERAGE_PERCENT:-N/A}"
+          if [ "$COVERAGE" = "N/A" ]; then
+            echo "::warning::No coverage data available"
+          else
+            THRESHOLD=75.0
+            if (( $(echo "$COVERAGE < $THRESHOLD" | bc -l) )); then
+              echo "::warning::Code coverage ${COVERAGE}% is below threshold ${THRESHOLD}%"
+            else
+              echo "Code coverage ${COVERAGE}% meets threshold ${THRESHOLD}%"
+            fi
+          fi
