@@ -19,7 +19,7 @@ Catalog of npm, pip, and global packages powering the agentic SDLC.
 
 | Plugin | Version | Source | Category |
 |--------|---------|--------|----------|
-| `superpowers` | 5.0.7 | claude-plugins-official | Workflow orchestration (brainstorming, TDD, plans, review) |
+| `superpowers` | 5.0.7 | obra/superpowers-marketplace | Workflow orchestration (brainstorming, TDD, plans, review) |
 | `frontend-design` | - | claude-plugins-official | Production-grade UI generation |
 | `code-simplifier` | 1.0.0 | claude-plugins-official | Code clarity and refactoring |
 | `agent-sdk-dev` | 1.0.0 | claude-code-plugins | Agent SDK app scaffolding |
@@ -65,7 +65,8 @@ We recommend Docker MCP as the primary integration. See `configs/mcp-servers/REA
 
 ## Maintenance Notes
 
-- **superpowers** is the most critical plugin - version 5.0.7 provides the core workflow skills (brainstorming, TDD, plan execution, code review, git worktrees)
+- **superpowers** is the most critical plugin - version 5.0.7 provides the core workflow skills (brainstorming, TDD, plan execution, code review, git worktrees) and should be credited to Jesse Vincent / `obra/superpowers`
+- **task-master-ai** should be traced to the Task Master docs (`docs.task-master.dev`) and upstream repo (`eyaltoledano/claude-task-master`) when documenting PRD orchestration flows
 - **xcodebuildmcp** is actively maintained by Sentry - updates frequently with Xcode releases
 - **buildatscale** plugins are community-maintained - check for updates quarterly
 - **LSP plugins** should be updated when language toolchain versions change (Xcode, Node, Python, .NET)

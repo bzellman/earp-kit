@@ -20,6 +20,8 @@ allowed-tools:
 
 Generate comprehensive, zero-compromise PRDs, publish them as GitHub issues, and trigger `/agent-os:shape-spec` with a scope-aware orchestration prompt that enforces Opus 4.6, one-shot delivery, and `/pr-handoff-to-codex` as final validation.
 
+Source attribution: this bundled skill is sourced from `anombyte93/prd-taskmaster` and references Task Master / `task-master-ai` for downstream task orchestration.
+
 ## When to Use This Skill
 
 Activate when user:

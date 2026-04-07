@@ -6,7 +6,8 @@ Claude Code plugins are installed via marketplaces and provide bundled skills, a
 
 | Marketplace | Plugins | Focus |
 |-------------|---------|-------|
-| `claude-plugins-official` | superpowers, frontend-design, agent-sdk-dev, code-simplifier | Core workflow skills |
+| `claude-plugins-official` | frontend-design, agent-sdk-dev, code-simplifier | Core workflow skills |
+| `obra/superpowers-marketplace` | superpowers | Core workflow skills |
 | `claude-code-plugins` | agent-sdk-dev, code-review, commit-commands, feature-dev, frontend-design, pr-review-toolkit, ralph-wiggum, security-guidance | Development workflow |
 | `claude-code-workflows` | code-documentation, business-analytics, content-marketing, python-development, javascript-typescript, systems-programming, shell-scripting, developer-essentials | Domain expertise |
 | `buildatscale-claude-code` | buildatscale, promo-video, nano-banana-pro | Build/deploy/video |
@@ -14,7 +15,8 @@ Claude Code plugins are installed via marketplaces and provide bundled skills, a
 ## Core Plugins
 
 ### superpowers v5.0.7
-**Source:** claude-plugins-official
+**Source:** obra/superpowers-marketplace
+**Upstream:** Jesse Vincent - `obra/superpowers`
 **Skills provided:**
 - `brainstorming` - Pre-implementation exploration of intent and design
 - `writing-plans` - Multi-step task planning before code
@@ -62,3 +64,9 @@ Claude Code plugins are installed via marketplaces and provide bundled skills, a
 | `pyright-lsp` | Python | 1.0.0 |
 | `csharp-lsp` | C# (OmniSharp) | 1.0.0 |
 | `clangd-lsp` | C/C++ | 1.0.0 |
+
+## Attribution Notes
+
+- Agent OS and Design OS attribution belongs to Brian Casel / Builder Methods. This repo includes adapted command and pattern layers, not official Builder Methods distributions.
+- `prd-taskmaster` in this repo is sourced from `anombyte93/prd-taskmaster`.
+- Task Master references in the planning flow map to `docs.task-master.dev` and `eyaltoledano/claude-task-master`.

@@ -23,7 +23,7 @@ These are installed at `~/.agentConfig/skills/` and available across all project
 | `openai-docs` | OpenAI API docs | Fetches up-to-date OpenAI documentation |
 | `pdf` | PDF files | Read, create, review PDFs with rendering |
 | `pr-handoff-to-codex` | PR ready for review | 4-agent adversarial Codex review |
-| `prd-taskmaster` | "PRD", "product requirements" | Generates PRD, publishes as GitHub issue |
+| `prd-taskmaster` | "PRD", "product requirements" | Generates PRD, publishes as GitHub issue; bundled from `anombyte93/prd-taskmaster` |
 | `prd-to-pr` | End-to-end PRD to PR | Full pipeline: PRD -> spec -> implement -> review -> deploy |
 | `remotion-best-practices` | Remotion video | Best practices for React video creation |
 | `security-threat-model` | Threat model a codebase | Repository-grounded threat modeling |

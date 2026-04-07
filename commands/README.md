@@ -6,6 +6,8 @@ Slash commands are user-invoked actions placed in `.claude/commands/` directorie
 
 Standards-driven development framework.
 
+Attribution: adapted from Agent OS by Brian Casel / Builder Methods. See `docs/upstream-attribution.md`.
+
 | Command | Description |
 |---------|-------------|
 | `/agent-os:discover-standards` | Scan codebase for implicit and explicit standards |
@@ -38,6 +40,8 @@ Cost, performance, and security management.
 ## Design-OS Commands (`design-os/`)
 
 Product design lifecycle from vision to export.
+
+Attribution: adapted from Design OS by Brian Casel / Builder Methods. See `docs/upstream-attribution.md`.
 
 | Command | Pipeline Stage | Description |
 |---------|---------------|-------------|

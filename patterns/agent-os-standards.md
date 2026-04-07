@@ -4,6 +4,8 @@
 
 A command suite that discovers, indexes, and injects project standards into agent context, ensuring all AI-assisted development follows established patterns.
 
+Attribution: this pattern is adapted from Agent OS by Brian Casel / Builder Methods. See `docs/upstream-attribution.md`.
+
 ## The 5 Commands
 
 ### `/agent-os:discover-standards`

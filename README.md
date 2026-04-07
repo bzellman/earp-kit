@@ -142,6 +142,7 @@ This is still an exploratory part of the framework for me. I kept it in the repo
 - [Architecture & Mermaid Diagrams](docs/architecture.md) - 3 detailed workflow maps
 - [CI/CD Catalog](docs/ci-cd-catalog.md) - All 16 GitHub Actions documented
 - [Package Inventory](docs/package-inventory.md) - npm, pip, MCP server catalog
+- [Upstream Attribution](docs/upstream-attribution.md) - Credits and source links for adapted frameworks and bundled components
 
 ## Public Hardening
 
@@ -193,7 +194,7 @@ These workflows are shipped as a catalog under `workflows/`, not as live `.githu
 
 To replicate the complete agentic SDLC:
 
-1. Install the [superpowers plugin](https://github.com/anthropics/claude-code-plugins) if it fits your workflow.
+1. Install [Superpowers by Jesse Vincent](https://github.com/obra/superpowers) from the [obra/superpowers-marketplace](https://github.com/obra/superpowers-marketplace) if it fits your workflow.
 2. Copy `skills/system/` to `~/.agentConfig/skills/`.
 3. Copy relevant `skills/project/` directories into your repo-scoped `.claude/skills/`.
 4. Copy relevant `agents/` to your project's `.claude/agents/`.
@@ -206,6 +207,13 @@ To replicate the complete agentic SDLC:
 ## Origin
 
 This catalog was extracted from real production usage across a mobile + cloud monorepo and then generalized into reusable templates. The goal is to preserve realistic patterns without shipping private infrastructure details, private repo references, embedded secrets, or non-portable local paths.
+
+## Upstream Attribution
+
+- Agent OS naming and standards-driven workflow attribution belongs to Brian Casel / Builder Methods. This repo includes an adapted public implementation of that style of workflow, not an official distribution. See [docs/upstream-attribution.md](docs/upstream-attribution.md).
+- Design OS naming and design-process attribution belongs to Brian Casel / Builder Methods. This repo keeps an adapted version because the approach looks promising, but it is still one of the least battle-tested parts of my own setup.
+- Superpowers is by Jesse Vincent and is distributed through [obra/superpowers](https://github.com/obra/superpowers) and the [obra/superpowers-marketplace](https://github.com/obra/superpowers-marketplace).
+- The bundled `prd-taskmaster` skill is sourced from [anombyte93/prd-taskmaster](https://github.com/anombyte93/prd-taskmaster) and references [Task Master](https://docs.task-master.dev/) / [`task-master-ai`](https://github.com/eyaltoledano/claude-task-master) for downstream task orchestration.
 
 ## Contributing
 

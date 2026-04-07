@@ -12,6 +12,12 @@ A Claude Code skill that generates **detailed, engineer-focused Product Requirem
 
 Think of it as your AI product manager that asks the right questions, writes comprehensive specs, and sets you up for successful implementation.
 
+## Attribution
+
+- This bundled skill is sourced from [anombyte93/prd-taskmaster](https://github.com/anombyte93/prd-taskmaster).
+- The downstream task breakdown tool it references is [Task Master](https://docs.task-master.dev/) / [`task-master-ai`](https://github.com/eyaltoledano/claude-task-master).
+- This repo republishes the skill as part of a broader SDLC catalog; it is not the upstream home for the original project.
+
 ## Why You Might Want This
 
 ### The Problem
@@ -605,4 +611,3 @@ MIT License - Use freely, modify as needed, share improvements if you want.
 - No work lost
 
 All enhancements work seamlessly with MCP or CLI integration!
-

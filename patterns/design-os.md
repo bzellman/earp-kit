@@ -4,6 +4,8 @@
 
 A 10-command suite for AI-driven product design, from vision to export. Each command handles one stage of the product design lifecycle.
 
+Attribution: this pattern is adapted from Design OS by Brian Casel / Builder Methods. See `docs/upstream-attribution.md`.
+
 ## The Command Pipeline
 
 ```
