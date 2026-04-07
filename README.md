@@ -71,13 +71,13 @@ System-level skills available across all projects:
 | [prd-taskmaster](skills/system/prd-taskmaster/) | Planning | PRD generation and GitHub issue publishing |
 | [triage](skills/system/triage/) | Planning | Batch work item classification and routing |
 | [senior-architect](skills/system/senior-architect/) | Architecture | Multi-platform system architecture design |
-| [security-threat-model](skills/system/security-threat-model/) | Security | Repository-grounded threat modeling |
 | [gh-fix-ci](skills/system/gh-fix-ci/) | CI/CD | GitHub Actions failure debugging |
 | [code-simplifier](skills/system/code-simplifier/) | Quality | Code clarity and consistency review |
 | [dead-code-cleanup](skills/system/dead-code-cleanup/) | Quality | Swift dead code removal in isolated worktree |
 | [ios-design](skills/system/ios-design/) | iOS | SwiftUI design system compliance |
 | [figma](skills/system/figma/) | Design | Figma-to-code translation via MCP |
 | [find-skills](skills/system/find-skills/) | Discovery | Skill discovery and installation |
+| [workflow-orchestrator](skills/system/workflow-orchestrator/) | Orchestration | Coordinates multiple pipelines in parallel when the task warrants it |
 
 [Full skills catalog](skills/README.md)
 
@@ -102,6 +102,8 @@ System-level skills available across all projects:
 | [design-os](commands/design-os/) | 10 commands | Product design lifecycle (vision to export) |
 
 [Full commands catalog](commands/README.md)
+
+Design-OS is included because I think the approach is promising, but it is the least battle-tested part of this repo in my own workflow so far.
 
 ### Workflows (`workflows/`)
 
@@ -133,12 +135,13 @@ System-level skills available across all projects:
 ### [Design-OS](patterns/design-os.md)
 10-command product design pipeline from vision to export, enforcing sequential design methodology.
 
+This is still an exploratory part of the framework for me. I kept it in the repo because it feels promising, but I have not used it nearly as heavily as the engineering and delivery paths yet.
+
 ## Documentation
 
 - [Architecture & Mermaid Diagrams](docs/architecture.md) - 3 detailed workflow maps
 - [CI/CD Catalog](docs/ci-cd-catalog.md) - All 16 GitHub Actions documented
 - [Package Inventory](docs/package-inventory.md) - npm, pip, MCP server catalog
-- [Threat Model](docs/security/threat-model.md) - Public-template threat model and review checklist
 
 ## Public Hardening
 
@@ -159,7 +162,7 @@ The `configs/settings/monorepo-fullstack.json` example is a safer baseline for r
 - **No network download commands** - `curl`, `wget`, `ssh`, `scp`, `rsync`, and `nc` are explicitly denied
 - **No wildcard shell execution** - the example only permits local inspection commands plus `git`
 
-Review and tighten this file to match your own threat model before adoption.
+Review and tighten this file to match your own security posture before adoption.
 
 Workflow files use `<YOUR_*>` placeholders and `${{ secrets.YOUR_* }}` names. Replace them with your own project identifiers, secret names, and service accounts before enabling any workflow in production.
 
