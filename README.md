@@ -12,6 +12,7 @@ A public catalog of Claude Code skills, agents, commands, workflow templates, an
 | **Workflows** | 16 | GitHub Actions (CI/CD, testing, ops, AI automation) |
 | **Workflow Helpers** | 10 | Companion `.github/actions`, `.github/scripts`, and drift checks for the workflow templates |
 | **Patterns** | 5 | Documented reusable patterns |
+| **Scripts** | 1 | Standalone developer tooling (tmux orchestrator) |
 | **Plugins** | 25+ | Claude Code marketplace plugins |
 | **MCP Servers** | 2 | Tool integrations (Docker recommended, Xcode) |
 
@@ -136,6 +137,14 @@ Design-OS is included because I think the approach is promising, but it is the l
 10-command product design pipeline from vision to export, enforcing sequential design methodology.
 
 This is still an exploratory part of the framework for me. I kept it in the repo because it feels promising, but I have not used it nearly as heavily as the engineering and delivery paths yet.
+
+### Scripts (`scripts/`)
+
+Standalone developer tooling that complements the skills and commands.
+
+| Script | What It Does |
+|--------|-------------|
+| [orchestrate](scripts/orchestrate/) | Tmux-based orchestrator that runs full Claude Code skill pipelines (`/bug-to-pr`, `/prd-to-pr`, `/triage`) in parallel, each in its own git worktree with complete skill access. Solves the sub-agent Skill tool limitation by spawning full interactive CLI sessions. 3-column tmux layout with health monitoring, cost guardrails, queue management, and session recovery. |
 
 ## Documentation
 
