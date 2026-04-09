@@ -17,6 +17,7 @@ These are installed at `~/.agentConfig/skills/` and available across all project
 | `figma` | Figma URLs, design-to-code | Fetches Figma context and translates to production code |
 | `find-skills` | "how do I", "find a skill" | Discovers and installs agent skills |
 | `gh-fix-ci` | Debug failing CI checks | Inspects GH Actions logs, diagnoses, drafts fix plan |
+| `install-tooling` | "install", "add skill", "add agent" | Project-aware skill/agent installer with redundancy detection, value alignment, conflict checking, and auto-patching |
 | `ios-design` | SwiftUI design | Design system compliance with Apple HIG |
 | `ios-simulator-skill` | iOS simulator operations | Build, run, test on iOS simulators; bundled from `conorluddy/ios-simulator-skill` |
 | `microsoft-foundry` | Microsoft AI platform integration | Microsoft AI platform integration |
